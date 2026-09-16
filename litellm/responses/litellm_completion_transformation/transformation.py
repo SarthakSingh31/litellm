@@ -78,6 +78,7 @@ from litellm.types.llms.openai import (
     ValidChatCompletionMessageContentTypesLiteral,
 )
 from litellm.types.responses.main import (
+    CompactionOutputItem,
     CustomToolCallOutputItem,
     GenericResponseOutputItem,
     GenericResponseOutputItemContentAnnotation,
@@ -108,6 +109,13 @@ from .custom_tools import (
 
 NamespaceNameMap: TypeAlias = Mapping[str, tuple[str, str]]
 NamespaceTool: TypeAlias = Mapping[str, object]
+_BridgeMessage: TypeAlias = (
+    AllMessageValues
+    | GenericChatCompletionMessage
+    | ChatCompletionMessageToolCall
+    | ChatCompletionResponseMessage
+    | Message
+)
 ResponseTools: TypeAlias = Sequence[Mapping[str, object]] | None
 ChatToolParam: TypeAlias = ChatCompletionToolParam | OpenAIMcpServerTool
 NAMESPACE_DESCRIPTION_SEPARATOR: Final = "\n\n"
@@ -145,6 +153,8 @@ _OBJECT_LIST_ADAPTER: Final = TypeAdapter(list[object])
 _DICT_ITEMS_LIST_ADAPTER: Final = TypeAdapter(list[dict[object, object]])
 _TEXT_ADAPTER: Final = TypeAdapter(str)
 _RESPONSES_API_TOOL_CHOICE_ADAPTER: Final = TypeAdapter(ToolChoice)
+_COMPACTION_BLOCKS_ADAPTER: Final = TypeAdapter(list[dict[str, object]])
+_COMPACTION_CONSUMER_PROVIDERS: Final = frozenset({"anthropic", "bedrock", "vertex_ai"})
 
 
 @runtime_checkable
@@ -436,10 +446,13 @@ class LiteLLMCompletionResponsesConfig:
         )
 
         litellm_completion_request: dict = {
-            "messages": LiteLLMCompletionResponsesConfig.transform_responses_api_input_to_messages(
-                input=input,
-                responses_api_request=responses_api_request,
-                replay_reasoning=True,
+            "messages": LiteLLMCompletionResponsesConfig._without_compaction_blocks_for_provider(
+                LiteLLMCompletionResponsesConfig.transform_responses_api_input_to_messages(
+                    input=input,
+                    responses_api_request=responses_api_request,
+                    replay_reasoning=True,
+                ),
+                custom_llm_provider=custom_llm_provider,
             ),
             "model": model,
             "tool_choice": LiteLLMCompletionResponsesConfig._transform_tool_choice(
@@ -728,14 +741,15 @@ class LiteLLMCompletionResponsesConfig:
         return LiteLLMCompletionResponsesConfig._merge_reasoning_only_assistant_messages(messages)
 
     @staticmethod
-    def _reasoning_only_assistant_message(
+    def _standalone_assistant_carrier_message(
         reasoning_text: str | None,
         thinking_blocks: Sequence[ChatCompletionThinkingBlock | ChatCompletionRedactedThinkingBlock] | None,
+        compaction_blocks: Sequence[Mapping[str, object]] | None = None,
     ) -> ChatCompletionResponseMessage:
         """
-        Build the assistant message that carries a prior turn's reasoning and
-        nothing else, so a reasoning item never reaches the provider as visible
-        assistant ``content``.
+        Build the assistant message that carries a prior turn's reasoning or
+        compaction summary and nothing else, so neither item reaches the
+        provider as visible assistant ``content``.
         """
         message: Final = ChatCompletionResponseMessage(role="assistant", content=None)
         if reasoning_text:
@@ -744,7 +758,62 @@ class LiteLLMCompletionResponsesConfig:
             message["thinking_blocks"] = list(  # mutable-ok: thinking_blocks is a list on the message contract
                 thinking_blocks
             )
+        if compaction_blocks:
+            message["provider_specific_fields"] = {  # mutable-ok: outbound chat messages are JSON dicts
+                "compaction_blocks": list(compaction_blocks),  # mutable-ok: anthropic_messages_pt requires a list
+            }
         return message
+
+    @staticmethod
+    def _without_compaction_blocks_for_provider(
+        messages: Sequence[_BridgeMessage],
+        custom_llm_provider: str | None,
+    ) -> list[_BridgeMessage]:
+        if custom_llm_provider is None or custom_llm_provider in _COMPACTION_CONSUMER_PROVIDERS:
+            return list(messages)  # mutable-ok: chat request messages are a list on the completion contract
+        carrier_ids: Final = frozenset(
+            id(msg)
+            for msg in messages
+            if isinstance(msg, Mapping) and LiteLLMCompletionResponsesConfig._message_compaction_blocks(msg) is not None
+        )
+        if not carrier_ids:
+            return list(messages)  # mutable-ok: chat request messages are a list on the completion contract
+        verbose_logger.warning(
+            "responses bridge: %s cannot consume compaction items, dropping them from %d replayed message(s)",
+            custom_llm_provider,
+            len(carrier_ids),
+        )
+
+        def _is_standalone_carrier(msg: Mapping[str, object]) -> bool:
+            return (
+                msg.get("content") is None
+                and not msg.get("tool_calls")
+                and not msg.get("reasoning_content")
+                and not msg.get("thinking_blocks")
+            )
+
+        def _stripped(msg: _BridgeMessage) -> _BridgeMessage:
+            if id(msg) not in carrier_ids or not isinstance(msg, Mapping):
+                return msg
+            fields: Final = _STR_KEY_DICT_ADAPTER.validate_python(msg.get("provider_specific_fields"))
+            kept_fields: Final = {  # mutable-ok: outbound chat messages are JSON dicts
+                k: v for k, v in fields.items() if k != "compaction_blocks"
+            }
+            without_fields: Final = {  # mutable-ok: outbound chat messages are JSON dicts
+                k: v for k, v in msg.items() if k != "provider_specific_fields"
+            }
+            return cast(  # cast-ok: the same message minus one provider field
+                ChatCompletionResponseMessage,
+                {**without_fields, "provider_specific_fields": kept_fields}  # mutable-ok: outbound JSON dict
+                if kept_fields
+                else without_fields,
+            )
+
+        return [  # mutable-ok: chat request messages are a list on the completion contract
+            _stripped(msg)
+            for msg in messages
+            if not (id(msg) in carrier_ids and isinstance(msg, Mapping) and _is_standalone_carrier(msg))
+        ]
 
     @staticmethod
     def _merge_reasoning_only_assistant_messages(
@@ -759,8 +828,9 @@ class LiteLLMCompletionResponsesConfig:
     ]:
         """
         Responses API emits prior-turn reasoning as its own ``reasoning`` input
-        item, which becomes a standalone assistant message with
-        ``content=None`` + ``reasoning_content``. Chat-completions providers
+        item (and a compacted summary as its own ``compaction`` item), which
+        becomes a standalone assistant message with ``content=None`` +
+        ``reasoning_content`` (or ``provider_specific_fields.compaction_blocks``). Chat-completions providers
         (e.g. DeepSeek V4, Kimi K2.6) expect the chain-of-thought on the
         assistant message that carries the answer or tool calls. This pass
         merges standalone reasoning-only assistant messages into the
@@ -807,17 +877,21 @@ class LiteLLMCompletionResponsesConfig:
                 return msg.get("tool_calls")
             return getattr(msg, "tool_calls", None)
 
+        _compaction_blocks: Final = LiteLLMCompletionResponsesConfig._message_compaction_blocks
+
         def _apply_pending(
             msg: object,
             pending_items: Sequence[
                 tuple[
                     str | None,
                     tuple[ChatCompletionThinkingBlock | ChatCompletionRedactedThinkingBlock, ...] | None,
+                    tuple[Mapping[str, object], ...] | None,
                 ]
             ],
         ) -> None:
-            pending_texts: Final = tuple(text for text, _ in pending_items if text)
-            pending_blocks: Final = tuple(block for _, blocks in pending_items for block in blocks or ())
+            pending_texts: Final = tuple(text for text, _, _ in pending_items if text)
+            pending_blocks: Final = tuple(block for _, blocks, _ in pending_items for block in blocks or ())
+            pending_compaction: Final = tuple(block for _, _, blocks in pending_items for block in blocks or ())
             if pending_texts:
                 existing_text: Final = _reasoning_text(msg)
                 combined: Final = "\n".join(pending_texts + ((existing_text,) if existing_text else ()))
@@ -833,8 +907,25 @@ class LiteLLMCompletionResponsesConfig:
                     cast(dict[str, object], msg)["thinking_blocks"] = replayed  # cast-ok: mutable reasoning carrier
                 else:
                     setattr(msg, "thinking_blocks", replayed)  # noqa: B010  # attribute name is fixed, not dynamic
+            if pending_compaction:
+                existing_fields: Final = (
+                    msg.get("provider_specific_fields")
+                    if isinstance(msg, dict)
+                    else getattr(msg, "provider_specific_fields", None)
+                )
+                replayed_blocks: Final = list(  # mutable-ok: anthropic_messages_pt requires a list
+                    pending_compaction + (_compaction_blocks(msg) or ())
+                )
+                replayed_fields: Final = {  # mutable-ok: outbound chat messages are JSON dicts
+                    **(existing_fields if isinstance(existing_fields, Mapping) else MappingProxyType({})),
+                    "compaction_blocks": replayed_blocks,
+                }
+                if isinstance(msg, dict):
+                    cast(dict[str, object], msg)["provider_specific_fields"] = replayed_fields  # cast-ok: carrier dict
+                else:
+                    setattr(msg, "provider_specific_fields", replayed_fields)  # noqa: B010  # attribute name is fixed, not dynamic
 
-        _standalone: Final = LiteLLMCompletionResponsesConfig._reasoning_only_assistant_message
+        _standalone: Final = LiteLLMCompletionResponsesConfig._standalone_assistant_carrier_message
 
         merged: list[  # mutable-ok: accumulator  # rebind-ok: accumulator
             AllMessageValues
@@ -846,6 +937,7 @@ class LiteLLMCompletionResponsesConfig:
             tuple[
                 str | None,
                 tuple[ChatCompletionThinkingBlock | ChatCompletionRedactedThinkingBlock, ...] | None,
+                tuple[Mapping[str, object], ...] | None,
             ]
         ] = []  # mutable-ok: accumulator
 
@@ -854,9 +946,13 @@ class LiteLLMCompletionResponsesConfig:
                 _role(msg) == "assistant"
                 and _content(msg) is None
                 and not _tool_calls(msg)
-                and (_reasoning_text(msg) is not None or _thinking_blocks(msg) is not None)
+                and (
+                    _reasoning_text(msg) is not None
+                    or _thinking_blocks(msg) is not None
+                    or _compaction_blocks(msg) is not None
+                )
             ):
-                pending.append((_reasoning_text(msg), _thinking_blocks(msg)))
+                pending.append((_reasoning_text(msg), _thinking_blocks(msg), _compaction_blocks(msg)))
                 continue
 
             if pending and _role(msg) == "assistant":
@@ -866,14 +962,14 @@ class LiteLLMCompletionResponsesConfig:
                 # Not followed by an assistant message — keep the reasoning
                 # standalone instead of dropping it.
                 merged.extend(  # mutable-ok: append reasoning messages
-                    [_standalone(text, blocks) for text, blocks in pending]  # mutable-ok: append reasoning messages
+                    _standalone(text, blocks, compaction) for text, blocks, compaction in pending
                 )
                 pending = []  # mutable-ok: reset accumulator
 
             merged.append(msg)
 
         merged.extend(  # mutable-ok: append trailing reasoning
-            [_standalone(text, blocks) for text, blocks in pending]  # mutable-ok: append trailing reasoning
+            _standalone(text, blocks, compaction) for text, blocks, compaction in pending
         )
 
         return merged
@@ -1409,9 +1505,29 @@ class LiteLLMCompletionResponsesConfig:
             if not reasoning_text and not thinking_blocks:
                 return []  # mutable-ok: empty drop result
             return [  # mutable-ok: single message result
-                LiteLLMCompletionResponsesConfig._reasoning_only_assistant_message(
+                LiteLLMCompletionResponsesConfig._standalone_assistant_carrier_message(
                     reasoning_text=reasoning_text,
                     thinking_blocks=thinking_blocks,
+                )
+            ]
+        elif input_item.get("type") == "compaction":
+            if not replay_reasoning:
+                return []  # mutable-ok: empty drop result
+            compaction_blocks: Final = LiteLLMCompletionResponsesConfig._decode_compaction_blocks_from_input_item(
+                input_item
+            )
+            if compaction_blocks is None:
+                verbose_logger.warning(
+                    "responses bridge: dropping compaction input item %s, "
+                    "encrypted_content carries no compaction summary this bridge can replay",
+                    input_item.get("id"),
+                )
+                return []  # mutable-ok: empty drop result
+            return [  # mutable-ok: single message result
+                LiteLLMCompletionResponsesConfig._standalone_assistant_carrier_message(
+                    reasoning_text=None,
+                    thinking_blocks=None,
+                    compaction_blocks=compaction_blocks,
                 )
             ]
         else:
@@ -1534,6 +1650,33 @@ class LiteLLMCompletionResponsesConfig:
         if block_type == "redacted_thinking":
             return bool(block.get("data"))
         return False
+
+    @staticmethod
+    def _decode_compaction_blocks_from_input_item(
+        input_item: Mapping[str, object],
+    ) -> tuple[Mapping[str, object], ...] | None:
+        """
+        Decode ``encrypted_content`` written by ``_encode_compaction_blocks``
+        back into the Anthropic ``compaction`` blocks it serialized.
+        """
+        encrypted_content: Final = input_item.get("encrypted_content")
+        if not isinstance(encrypted_content, str) or not encrypted_content.strip():
+            return None
+        try:
+            blocks: Final = _COMPACTION_BLOCKS_ADAPTER.validate_json(encrypted_content)
+        except ValidationError:
+            return None
+        return LiteLLMCompletionResponsesConfig._replayable_compaction_blocks(blocks)
+
+    @staticmethod
+    def _replayable_compaction_blocks(
+        blocks: Sequence[Mapping[str, object]],
+    ) -> tuple[Mapping[str, object], ...] | None:
+        """
+        Anthropic's block shape is theirs to extend, so only the two keys the
+        replay depends on are checked and every other key rides along untouched.
+        """
+        return tuple(block for block in blocks if block.get("type") == "compaction" and block.get("content")) or None
 
     @staticmethod
     def _is_input_item_tool_call_output(input_item: Mapping[str, object]) -> bool:
@@ -2493,6 +2636,7 @@ class LiteLLMCompletionResponsesConfig:
         | ResponseFunctionToolCall
         | ResponseFunctionWebSearch
         | CustomToolCallOutputItem
+        | CompactionOutputItem
     ]:
         responses_output: list[
             GenericResponseOutputItem
@@ -2502,8 +2646,12 @@ class LiteLLMCompletionResponsesConfig:
             | ResponseFunctionToolCall
             | ResponseFunctionWebSearch
             | CustomToolCallOutputItem
+            | CompactionOutputItem
         ] = []
 
+        responses_output.extend(
+            LiteLLMCompletionResponsesConfig.extract_compaction_output_items(chat_completion_response)
+        )
         responses_output.extend(
             LiteLLMCompletionResponsesConfig._extract_reasoning_output_items(chat_completion_response, choices)
         )
@@ -2568,6 +2716,43 @@ class LiteLLMCompletionResponsesConfig:
                     else:
                         output_items.append(item)
         return output_items
+
+    @staticmethod
+    def _message_compaction_blocks(message: object) -> tuple[Mapping[str, object], ...] | None:
+        provider_specific_fields: Final = (
+            message.get("provider_specific_fields")
+            if isinstance(message, Mapping)
+            else getattr(message, "provider_specific_fields", None)
+        )
+        if not isinstance(provider_specific_fields, Mapping):
+            return None
+        raw_blocks: Final = provider_specific_fields.get("compaction_blocks")
+        if not isinstance(raw_blocks, list) or not raw_blocks:
+            return None
+        try:
+            blocks: Final = _COMPACTION_BLOCKS_ADAPTER.validate_python(raw_blocks)
+        except ValidationError:
+            return None
+        return LiteLLMCompletionResponsesConfig._replayable_compaction_blocks(blocks)
+
+    @staticmethod
+    def _encode_compaction_blocks(blocks: Sequence[Mapping[str, object]]) -> str:
+        return json.dumps(tuple(blocks), separators=(",", ":"))
+
+    @staticmethod
+    def extract_compaction_output_items(chat_completion_response: ModelResponse) -> list[CompactionOutputItem]:
+        return [  # mutable-ok: responses_output is built as a list
+            CompactionOutputItem(
+                type="compaction",
+                id=f"cmp_{uuid.uuid4()}",
+                encrypted_content=LiteLLMCompletionResponsesConfig._encode_compaction_blocks(blocks),
+            )
+            for choice in chat_completion_response.choices or ()
+            for blocks in (
+                LiteLLMCompletionResponsesConfig._message_compaction_blocks(getattr(choice, "message", None)),
+            )
+            if blocks
+        ]
 
     @staticmethod
     def _encode_thinking_blocks(message: Message) -> str | None:
