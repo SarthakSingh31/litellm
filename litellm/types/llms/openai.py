@@ -84,6 +84,7 @@ from typing_extensions import (
 
 from litellm.types.llms.base import BaseLiteLLMOpenAIResponseObject
 from litellm.types.responses.main import (
+    CompactionOutputItem,
     CustomToolCallOutputItem,
     GenericResponseOutputItem,
     OutputCodeInterpreterCall,
@@ -1372,6 +1373,7 @@ class ResponsesAPIResponse(BaseLiteLLMOpenAIResponseObject):
             | ResponseFunctionToolCall
             | ResponseFunctionWebSearch
             | CustomToolCallOutputItem
+            | CompactionOutputItem
         ]
     )
     parallel_tool_calls: bool | None = None

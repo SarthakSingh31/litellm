@@ -132,6 +132,12 @@ class CustomToolCallOutputItem(BaseLiteLLMOpenAIResponseObject):
     status: Literal["in_progress", "completed", "incomplete"] | None = None
 
 
+class CompactionOutputItem(BaseLiteLLMOpenAIResponseObject):
+    type: Literal["compaction"]
+    id: str
+    encrypted_content: str
+
+
 class GenericResponseOutputItem(BaseLiteLLMOpenAIResponseObject):
     """
     Generic response API output item
