@@ -713,11 +713,21 @@ class ModelResponseIterator:
                 provider_specific_fields["thinking_blocks"] = thinking_blocks
                 if reasoning_content is None:
                     reasoning_content = ""
-        elif "content" in content_block["delta"] and content_block["delta"].get("type") == "compaction_delta":
-            # Handle compaction delta
+        elif content_block["delta"].get("type") == "compaction_delta":
+            delta_content: Final = content_block["delta"].get("content") or ""
+            if self.compaction_blocks:
+                previous_content: Final = self.compaction_blocks[-1].get("content")
+                self.compaction_blocks = [  # mutable-ok: compaction_blocks is a list on the Delta contract
+                    *self.compaction_blocks[:-1],
+                    {  # mutable-ok: raw Anthropic content block dict
+                        **self.compaction_blocks[-1],
+                        "content": (previous_content if isinstance(previous_content, str) else "") + delta_content,
+                    },
+                ]
+                provider_specific_fields["compaction_blocks"] = self.compaction_blocks
             provider_specific_fields["compaction_delta"] = {
                 "type": "compaction_delta",
-                "content": content_block["delta"]["content"],
+                "content": delta_content,
             }
 
         return (
@@ -898,7 +908,10 @@ class ModelResponseIterator:
                 elif content_block_start["content_block"]["type"] == "compaction":
                     # Handle compaction blocks
                     # The full content comes in content_block_start
-                    self.compaction_blocks.append(content_block_start["content_block"])
+                    self.compaction_blocks = [  # mutable-ok: compaction_blocks is a list on the Delta contract
+                        *self.compaction_blocks,
+                        content_block_start["content_block"],
+                    ]
                     provider_specific_fields["compaction_blocks"] = self.compaction_blocks
                     provider_specific_fields["compaction_start"] = {
                         "type": "compaction",

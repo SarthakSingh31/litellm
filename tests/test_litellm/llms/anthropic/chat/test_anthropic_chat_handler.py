@@ -222,6 +222,33 @@ def test_streaming_thinking_blocks_are_replayable_after_signature_delta():
     }
 
 
+def test_streaming_compaction_delta_is_folded_into_compaction_block():
+    model_response_iterator = ModelResponseIterator(
+        streaming_response=MagicMock(), sync_stream=True, json_mode=False
+    )
+    chunks = [
+        {
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "compaction", "content": ""},
+        },
+        {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "compaction_delta", "content": "Summary of the conversation so far."},
+        },
+    ]
+
+    parsed_chunks = [model_response_iterator.chunk_parser(chunk=chunk) for chunk in chunks]
+
+    assert parsed_chunks[-1].choices[0].delta.provider_specific_fields["compaction_blocks"] == [
+        {"type": "compaction", "content": "Summary of the conversation so far."}
+    ]
+    assert parsed_chunks[0].choices[0].delta.provider_specific_fields["compaction_blocks"] == [
+        {"type": "compaction", "content": ""}
+    ]
+
+
 def test_streaming_unsigned_thinking_deltas_keep_reasoning_content():
     model_response_iterator = ModelResponseIterator(
         streaming_response=MagicMock(), sync_stream=True, json_mode=False
