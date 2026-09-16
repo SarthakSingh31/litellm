@@ -1131,3 +1131,48 @@ async def test_plain_text_stream_announces_exactly_one_message_item(sync_mode: b
             ResponsesAPIStreamEvents.OUTPUT_TEXT_DONE,
         ):
             assert event.item_id == message_item_adds[0].item.id
+
+
+def test_streamed_compaction_block_is_emitted_as_compaction_item():
+    compaction_block = {"type": "compaction", "content": "Summary of the conversation so far."}
+    chunks = [
+        ModelResponseStream(
+            id=CHAT_COMPLETION_ID,
+            created=1748575031,
+            model="claude-sonnet-5",
+            object="chat.completion.chunk",
+            choices=[
+                StreamingChoices(
+                    index=0,
+                    delta=Delta(
+                        role="assistant",
+                        content="",
+                        provider_specific_fields={"compaction_blocks": [compaction_block]},
+                    ),
+                    finish_reason=None,
+                )
+            ],
+        ),
+        _chunk("Continuing."),
+        _chunk("", finish_reason="stop"),
+    ]
+    events = [event.model_dump(exclude_none=True) for event in _build_iterator(chunks)]
+
+    compaction_events = [e for e in events if e.get("item", {}).get("type") == "compaction"]
+    assert [e["type"] for e in compaction_events] == ["response.output_item.added", "response.output_item.done"]
+    streamed_item = compaction_events[-1]["item"]
+    assert streamed_item["id"].startswith("cmp_")
+    assert json.loads(streamed_item["encrypted_content"]) == [compaction_block]
+    assert {e["output_index"] for e in compaction_events} == {compaction_events[0]["output_index"]}
+    assert compaction_events[0]["sequence_number"] < compaction_events[1]["sequence_number"]
+
+    message_done = next(
+        e for e in events if e["type"] == "response.output_item.done" and e["item"]["type"] == "message"
+    )
+    assert events.index(compaction_events[-1]) < events.index(message_done)
+
+    completed = events[-1]
+    assert completed["type"] == "response.completed"
+    assert completed["response"]["output"][0]["type"] == "compaction"
+    assert completed["response"]["output"][0]["id"] == streamed_item["id"]
+    assert completed["response"]["output"][0]["encrypted_content"] == streamed_item["encrypted_content"]

@@ -44,6 +44,7 @@ from litellm.types.llms.openai import (
     WebSearchCallInProgressEvent,
     WebSearchCallSearchingEvent,
 )
+from litellm.types.responses.main import CompactionOutputItem
 from litellm.types.utils import Delta as ChatCompletionDelta
 from litellm.types.utils import (
     ModelResponse,
@@ -142,6 +143,8 @@ class LiteLLMCompletionStreamingIterator(ResponsesAPIStreamingIterator):
         )
         self._web_search_calls: dict[str, object] = {}  # mutable-ok: latest call by provider id
         self._queued_web_search_call_ids: set[str] = set()  # mutable-ok: emitted call ids
+        self._compaction_item: CompactionOutputItem | None = None
+        self._compaction_events_queued: bool = False
 
     def _get_or_assign_tool_output_index(self, call_id: str) -> int:
         existing: Final = self._tool_output_index_by_call_id.get(call_id)
@@ -389,6 +392,32 @@ class LiteLLMCompletionStreamingIterator(ResponsesAPIStreamingIterator):
                 item=BaseLiteLLMOpenAIResponseObject(**item_kwargs),
             )
             self._pending_tool_events.append(item_done_event)
+
+    def _queue_compaction_events(self, litellm_model_response: ModelResponse) -> None:
+        if self._compaction_events_queued:
+            return
+        self._compaction_events_queued = True
+        items: Final = LiteLLMCompletionResponsesConfig.extract_compaction_output_items(litellm_model_response)
+        if not items:
+            return
+        self._compaction_item = items[0]
+        output_index: Final = self._next_tool_output_index
+        self._next_tool_output_index += 1
+        self._sequence_number += 1
+        added: Final = OutputItemAddedEvent(
+            type=ResponsesAPIStreamEvents.OUTPUT_ITEM_ADDED,
+            output_index=output_index,
+            item=BaseLiteLLMOpenAIResponseObject(**self._compaction_item.model_dump()),
+        )
+        setattr(added, "sequence_number", self._sequence_number)  # noqa: B010  # attribute name is fixed, not dynamic
+        self._sequence_number += 1
+        done: Final = OutputItemDoneEvent(
+            type=ResponsesAPIStreamEvents.OUTPUT_ITEM_DONE,
+            output_index=output_index,
+            sequence_number=self._sequence_number,
+            item=BaseLiteLLMOpenAIResponseObject(**self._compaction_item.model_dump()),
+        )
+        self._pending_tool_events.extend((added, done))
 
     def _queue_web_search_events(self, call_id: str, web_search_call: object) -> None:
         from openai.types.responses import ResponseFunctionWebSearch
@@ -898,6 +927,7 @@ class LiteLLMCompletionStreamingIterator(ResponsesAPIStreamingIterator):
         if self.litellm_model_response:
             # If tool calls exist, emit tool events before finishing/response.completed.
             if isinstance(self.litellm_model_response, ModelResponse):
+                self._queue_compaction_events(self.litellm_model_response)
                 self._queue_final_tool_call_done_events(self.litellm_model_response)
             if self._pending_tool_events:
                 return self._pending_tool_events.pop(0)
@@ -1256,7 +1286,11 @@ class LiteLLMCompletionStreamingIterator(ResponsesAPIStreamingIterator):
             "reasoning",
             self._cached_reasoning_item_id,
         )
-        return reasoning_aligned
+        return _output_items_with_id(
+            reasoning_aligned,
+            "compaction",
+            self._compaction_item.id if self._compaction_item is not None else None,
+        )
 
     def _emit_response_completed_event(self, litellm_model_response: ModelResponse) -> ResponseCompletedEvent | None:
         if litellm_model_response:
