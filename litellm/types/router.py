@@ -172,6 +172,7 @@ class ModelInfo(MirroredPricingParams):
     created_by: str | None = None
 
     base_model: str | None = None  # specify if the base model is azure/gpt-3.5-turbo etc for accurate cost tracking
+    supports_native_compaction: bool | None = None
     tier: Literal["free", "paid"] | None = None
 
     """

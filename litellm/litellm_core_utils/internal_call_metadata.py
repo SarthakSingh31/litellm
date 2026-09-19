@@ -18,12 +18,17 @@ caller's identity metadata, minus two things that must never be forwarded as-is:
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Final
 
 from litellm.constants import INTERNAL_CALL_ORIGIN_METADATA_KEY, NON_INFERENCE_CALL_TYPES
 from litellm.litellm_core_utils.initialize_dynamic_callback_params import initialize_standard_callback_dynamic_params
-from litellm.types.utils import BACKGROUND_RESPONSE_COST_POLL_CALL_ORIGIN, InternalCallOrigin
+from litellm.types.utils import (
+    BACKGROUND_RESPONSE_COST_POLL_CALL_ORIGIN,
+    RESPONSES_COMPACTION_CALL_ORIGIN,
+    InternalCallOrigin,
+)
 
 BUDGET_RESERVATION_METADATA_KEYS: Final = frozenset({"user_api_key_budget_reservation"})
 
@@ -35,6 +40,13 @@ The ``user_api_key`` prefix is load-bearing, not cosmetic: when a request carrie
 copies a key across only when ``user_api_key`` appears in its name."""
 
 _USER_API_KEY_AUTH_KEY: Final = "user_api_key_auth"
+_RESPONSES_COMPACTION_HISTORY_KEY: Final = "_responses_compaction_history"
+
+
+@dataclass(frozen=True, slots=True)
+class _ResponsesCompactionHistory:
+    pass
+
 
 FORWARDABLE_IDENTITY_METADATA_KEYS: Final = frozenset(
     {
@@ -81,6 +93,10 @@ def is_unbilled_non_inference_call(
     """
     if call_type not in NON_INFERENCE_CALL_TYPES:
         return False
+    if metadata is not None and isinstance(
+        metadata.get(_RESPONSES_COMPACTION_HISTORY_KEY), _ResponsesCompactionHistory
+    ):
+        return True
     if is_background_response(response):
         return False
     if metadata is None:
@@ -141,6 +157,16 @@ def forwarded_internal_call_metadata(
         return {}  # mutable-ok: SDK metadata kwarg
     return _sanitized(parent_metadata) | {  # mutable-ok: SDK metadata kwarg
         INTERNAL_CALL_ORIGIN_METADATA_KEY: call_origin
+    }
+
+
+def responses_compaction_history_metadata(
+    parent: Mapping[str, object] | None,
+) -> dict[str, object]:  # mutable-ok: SDK metadata kwarg
+    return forwarded_internal_call_metadata(
+        parent, RESPONSES_COMPACTION_CALL_ORIGIN
+    ) | {  # mutable-ok: SDK metadata kwarg
+        _RESPONSES_COMPACTION_HISTORY_KEY: _ResponsesCompactionHistory(),
     }
 
 

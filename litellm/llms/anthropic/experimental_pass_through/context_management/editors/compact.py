@@ -45,6 +45,7 @@ from ..constants import (
     COMPACT_EDIT_TYPE,
     COMPACT_MIN_TRIGGER_TOKENS,
     COMPACT_NO_TOOL_CALLS_SUFFIX,
+    COMPACT_SAME_AS_REQUEST,
     COMPACT_SUMMARY_MAX_TOKENS,
     COMPACT_SUMMARY_MAX_TOKENS_SETTING_KEY,
     COMPACT_SUMMARY_MODEL_SETTING_KEY,
@@ -1164,6 +1165,11 @@ async def apply_compact_20260112(
     # Opt-in gate: no summary model configured → no-op (but still return the
     # Phase A-sliced/stripped messages so compaction blocks don't leak).
     summary_model: Final = _read_summary_model_setting()
+    if summary_model == COMPACT_SAME_AS_REQUEST:
+        raise AnthropicContextManagementError(
+            status_code=400,
+            message="same_as_request compaction requires the Responses API; use an explicit summary alias for Messages",
+        )
     if summary_model is None:
         applied["error"] = "summary_model_not_configured"
         # Slice-only forwarding: ``augmented_system`` already carries any prior

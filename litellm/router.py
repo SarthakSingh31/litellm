@@ -5199,21 +5199,47 @@ class Router:
         Helper function to make a generic LLM API call through the router, this allows you to use retries/fallbacks with litellm router
         """
 
+        from litellm.responses.compaction import COMPACTION_SESSION_KEY, CompactionSession, prepare_compaction
+
+        compaction_session: Final = kwargs.get(COMPACTION_SESSION_KEY)
         passthrough_on_no_deployment: Final = kwargs.pop("passthrough_on_no_deployment", False)
         function_name: Final = "_ageneric_api_call_with_fallbacks"
         deployment = None  # rebind-ok: pre-init so the except block can stamp a failure with no deployment picked
         try:
             parent_otel_span: Final = _get_parent_otel_span_from_kwargs(kwargs)
             try:
-                deployment = await self.async_get_available_deployment(  # rebind-ok: set on success, see pre-init above
-                    model=model,
-                    request_kwargs=kwargs,
-                    messages=kwargs.get("messages", None),
-                    input=kwargs.get("input", None),
-                    specific_deployment=kwargs.pop("specific_deployment", None),
-                )
+                if isinstance(compaction_session, CompactionSession) and compaction_session.locked:
+                    pinned: Final = (
+                        self.get_deployment(compaction_session.deployment_id)
+                        if compaction_session.deployment_id is not None
+                        else None
+                    )
+                    if pinned is None:
+                        raise litellm.ServiceUnavailableError(
+                            message="The deployment used for Responses compaction is no longer available",
+                            model=model,
+                            llm_provider="",
+                        )
+                    eligible: Final = await self.async_get_healthy_deployments(
+                        model=model,
+                        request_kwargs=kwargs,
+                        input=kwargs.get("input"),
+                        parent_otel_span=parent_otel_span,
+                        _compaction_deployment=pinned.model_dump(exclude_none=True),
+                    )
+                    deployment = eligible[0]  # rebind-ok: pinned singleton passed all eligibility checks
+                else:
+                    deployment = await self.async_get_available_deployment(  # rebind-ok: selected once for this attempt
+                        model=model,
+                        request_kwargs=kwargs,
+                        messages=kwargs.get("messages", None),
+                        input=kwargs.get("input", None),
+                        specific_deployment=kwargs.pop("specific_deployment", None),
+                    )
             except Exception as e:
-                if passthrough_on_no_deployment:
+                if passthrough_on_no_deployment and not (
+                    isinstance(compaction_session, CompactionSession) and compaction_session.locked
+                ):
                     return await original_generic_function(model=model, **kwargs)
                 raise e
 
@@ -5240,8 +5266,55 @@ class Router:
             if custom_llm_provider is not None:
                 response_kwargs["custom_llm_provider"] = custom_llm_provider
 
+            async def execute_summary(
+                summary_kwargs: Mapping[str, object],
+            ) -> Union["ResponsesAPIResponse", "BaseResponsesAPIStreamingIterator"]:
+                from litellm.litellm_core_utils.core_helpers import safe_deep_copy
+
+                child_kwargs: Final = {
+                    key: safe_deep_copy(value)
+                    if key in ("metadata", "litellm_metadata", "litellm_params", "standard_logging_object")
+                    else value
+                    for key, value in summary_kwargs.items()
+                }
+                set_io_token_rate_limit_request_kwargs(
+                    child_kwargs, store_in_context=deployment_has_io_token_limits(deployment)
+                )
+                await self.async_get_healthy_deployments(
+                    model=model,
+                    request_kwargs=child_kwargs,
+                    input=child_kwargs.get("input"),
+                    parent_otel_span=parent_otel_span,
+                    _compaction_deployment=deployment,
+                )
+                async with self._deployment_slot(
+                    deployment=deployment, kwargs=child_kwargs, parent_otel_span=parent_otel_span
+                ):
+                    if isinstance(compaction_session, CompactionSession):
+                        compaction_session.lock(child_kwargs)
+                    child_response: Final = await original_generic_function(**child_kwargs)
+                await self.increment_deployment_usage_for_response(
+                    response=child_response, request_kwargs={**child_kwargs, "model": model}
+                )
+                return child_response
+
+            if isinstance(compaction_session, CompactionSession):
+                compaction_session.deployment_id = deployment["model_info"]["id"]
+            prepared_response_kwargs: Final = (
+                {
+                    **await prepare_compaction(response_kwargs, compaction_session, execute_summary),
+                    COMPACTION_SESSION_KEY: compaction_session,
+                }
+                if isinstance(compaction_session, CompactionSession)
+                else response_kwargs
+            )
+
+            if isinstance(compaction_session, CompactionSession) and compaction_session.locked:
+                set_io_token_rate_limit_request_kwargs(
+                    prepared_response_kwargs, store_in_context=deployment_has_io_token_limits(deployment)
+                )
             async with self._deployment_slot(deployment=deployment, kwargs=kwargs, parent_otel_span=parent_otel_span):
-                response = await original_generic_function(**response_kwargs)
+                response = await original_generic_function(**prepared_response_kwargs)
 
             if self._should_raise_anthropic_refusal_error(
                 model=model,
@@ -5283,9 +5356,13 @@ class Router:
         during iteration triggers the Router's cross-provider fallback chain.
         """
         from litellm.litellm_core_utils.core_helpers import safe_deep_copy
+        from litellm.responses.compaction import COMPACTION_SESSION_KEY, CompactionSession, finish_compaction
         from litellm.responses.streaming_iterator import (
             BaseResponsesAPIStreamingIterator,
         )
+
+        compaction_session: Final = CompactionSession(defer_summary_lock=True)
+        kwargs[COMPACTION_SESSION_KEY] = compaction_session  # rebind-ok: one session shared across routing attempts
 
         # Snapshot the request kwargs before _ageneric_api_call_with_fallbacks
         # mutates them. A shallow copy alone is not enough: the primary
@@ -5325,11 +5402,12 @@ class Router:
             record_pre_routing_selection(fallback_kwargs, live_pre_routing_selection)
 
         if kwargs.get("stream") and isinstance(response, BaseResponsesAPIStreamingIterator):
-            return await self._aresponses_streaming_iterator(
+            fallback_response: Final = await self._aresponses_streaming_iterator(
                 response=response,
                 initial_kwargs=fallback_kwargs,
             )
-        return response
+            return finish_compaction(fallback_response, compaction_session)
+        return finish_compaction(response, compaction_session)
 
     async def _aanthropic_messages_streaming_iterator(
         self,
@@ -7147,6 +7225,12 @@ class Router:
         """
         Common utilities for async_function_with_fallbacks
         """
+        from litellm.responses.compaction import COMPACTION_SESSION_KEY, CompactionSession
+
+        compaction_session: Final = kwargs.get(COMPACTION_SESSION_KEY)
+        if isinstance(compaction_session, CompactionSession) and compaction_session.locked:
+            raise e
+
         if verbose_router_logger.isEnabledFor(logging.DEBUG):
             verbose_router_logger.debug("Traceback%s", redact_string(traceback.format_exc()))
         original_exception: Final = e
@@ -12692,6 +12776,7 @@ class Router:
         specific_deployment: bool | None = False,
         parent_otel_span: Span | None = None,
         health_check_probe: bool = False,
+        _compaction_deployment: Mapping[str, object] | None = None,
     ) -> list[dict] | dict:
         """
         Get the healthy deployments for a model.
@@ -12702,13 +12787,21 @@ class Router:
         - Dict, if specific model chosen
         """
 
-        model, healthy_deployments = self._common_checks_available_deployment(
-            model=model,
-            messages=messages,
-            input=input,
-            specific_deployment=specific_deployment,
-            request_kwargs=request_kwargs,
-        )
+        if _compaction_deployment is None:
+            model, healthy_deployments = self._common_checks_available_deployment(
+                model=model,
+                messages=messages,
+                input=input,
+                specific_deployment=specific_deployment,
+                request_kwargs=request_kwargs,
+            )
+        else:
+            healthy_deployments = self._filter_deployments_by_model_access_groups(
+                model=model,
+                healthy_deployments=[dict(_compaction_deployment)],
+                request_kwargs=request_kwargs,
+                request_team_id=get_request_team_id(request_kwargs),
+            )
 
         # IF TEAM ID SPECIFIED ON MODEL, AND REQUEST CONTAINS USER_API_KEY_TEAM_ID, FILTER OUT MODELS THAT ARE NOT IN THE TEAM
         ## THIS PREVENTS WRITING FILES OF OTHER TEAMS TO MODELS THAT ARE TEAM-ONLY MODELS
@@ -12773,7 +12866,9 @@ class Router:
             parent_otel_span=parent_otel_span,
         )
 
-        if self.enable_pre_call_checks and (messages is not None or input is not None):
+        if (self.enable_pre_call_checks or _compaction_deployment is not None) and (
+            messages is not None or input is not None
+        ):
             deployments_to_check: Final = cast(list[dict], healthy_deployments)
             healthy_deployments = self._pre_call_checks(
                 model=model,
@@ -12832,6 +12927,14 @@ class Router:
             )
             or healthy_deployments
         )
+
+        if _compaction_deployment is not None:
+            healthy_deployments = [
+                candidate
+                for candidate in healthy_deployments
+                if candidate.get("model_info") == _compaction_deployment.get("model_info")
+                and candidate.get("litellm_params") == _compaction_deployment.get("litellm_params")
+            ]
 
         if len(healthy_deployments) == 0:
             exception: Final = await async_raise_no_deployment_exception(

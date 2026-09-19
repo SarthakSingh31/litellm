@@ -26,6 +26,7 @@ COMPACT_SUMMARY_MAX_TOKENS_SETTING_KEY: Final = "context_management_summary_max_
 # ``summary_call_failed`` path and forwards the request without compaction.
 COMPACT_SUMMARY_TIMEOUT_SECONDS: Final = 60.0
 COMPACT_SUMMARY_MODEL_SETTING_KEY: Final = "context_management_summary_model"
+COMPACT_SAME_AS_REQUEST: Final = "same_as_request"
 COMPACT_SUMMARY_SYSTEM_PREFIX: Final = "Previous conversation summary: "
 
 # Default summarization prompt from the Anthropic spec.

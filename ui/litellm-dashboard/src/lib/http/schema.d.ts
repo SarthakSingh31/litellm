@@ -41285,6 +41285,8 @@ export interface components {
             ptu_effective_from?: string | null;
             /** Ptu Effective To */
             ptu_effective_to?: string | null;
+            /** Supports Native Compaction */
+            supports_native_compaction?: boolean | null;
             /** Team Id */
             team_id?: string | null;
             /** Team Public Model Name */

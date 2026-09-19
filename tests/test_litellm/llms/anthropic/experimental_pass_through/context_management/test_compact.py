@@ -23,6 +23,10 @@ from litellm.llms.anthropic.experimental_pass_through.context_management import 
     AnthropicContextManagementError,
     apply_context_management,
 )
+from litellm.llms.anthropic.experimental_pass_through.context_management.constants import (
+    COMPACT_SAME_AS_REQUEST,
+    COMPACT_SUMMARY_MODEL_SETTING_KEY,
+)
 from litellm.llms.anthropic.experimental_pass_through.context_management.editors.compact import (
     _augment_system_with_summary,
     _extract_summary_text,
@@ -352,6 +356,21 @@ async def test_opt_in_gating_no_summary_model_configured():
     assert result.system == "system prompt"
     assert result.compaction_block is None
     assert result.iterations_usage is None
+
+
+async def test_same_request_selector_is_not_routed_as_a_messages_model_alias(monkeypatch: pytest.MonkeyPatch) -> None:
+    from litellm.proxy import proxy_server
+
+    monkeypatch.setitem(proxy_server.general_settings, COMPACT_SUMMARY_MODEL_SETTING_KEY, COMPACT_SAME_AS_REQUEST)
+    with pytest.raises(AnthropicContextManagementError, match="Responses API") as error:
+        await apply_compact_20260112(
+            model=MODEL,
+            messages=_simple_messages(),
+            tools=None,
+            system=None,
+            edit_spec=_EDIT_SPEC_DEFAULT,
+        )
+    assert error.value.status_code == 400
 
 
 async def test_opt_in_gating_no_summary_model_keeps_post_compaction_tail():

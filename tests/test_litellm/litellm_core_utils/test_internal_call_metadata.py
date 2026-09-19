@@ -1,11 +1,26 @@
 """Unit tests for internal-call metadata forwarding: budget-reservation stripping and origin stamping."""
 
+from copy import deepcopy
+from typing import Final
+
+import pytest
+from pydantic import TypeAdapter
+
 from litellm.constants import INTERNAL_CALL_ORIGIN_METADATA_KEY
 from litellm.litellm_core_utils.internal_call_metadata import (
     forwarded_internal_call_metadata,
+    is_unbilled_non_inference_call,
+    is_unbilled_non_inference_call_from_params,
+    responses_compaction_history_metadata,
     sanitized_forwardable_call_metadata,
 )
-from litellm.types.utils import SHADOW_EVAL_ROUTER_CALL_ORIGIN
+from litellm.proxy._types import UserAPIKeyAuth
+from litellm.proxy.hooks.proxy_track_cost_callback import _get_budget_reservation_from_metadata
+from litellm.types.utils import (
+    BACKGROUND_RESPONSE_COST_POLL_CALL_ORIGIN,
+    RESPONSES_COMPACTION_CALL_ORIGIN,
+    SHADOW_EVAL_ROUTER_CALL_ORIGIN,
+)
 
 PARENT = {
     "user_api_key": "sk-hash",
@@ -119,3 +134,63 @@ class TestSubCallMetadataSanitization:
         assert sanitized_auth.team_id == "team-1"
         assert sanitized_auth.api_key == auth.api_key
         assert auth.budget_reservation == {"reserved_cost": 1.0}
+
+
+@pytest.mark.parametrize("auth_shape", ["mapping", "model"])
+def test_compaction_history_metadata_strips_parent_reservation_without_mutation(auth_shape: str) -> None:
+    reservation: Final = {"reserved_cost": 2.0, "finalized": False}
+    auth: Final = (
+        {"api_key": "test-key", "budget_reservation": reservation}
+        if auth_shape == "mapping"
+        else UserAPIKeyAuth(api_key="test-key", budget_reservation=reservation)
+    )
+    parent: Final = {
+        "user_api_key": "test-key",
+        "user_api_key_auth": auth,
+        "user_api_key_budget_reservation": reservation,
+        "routing_decision": "selected-deployment",
+    }
+    before: Final = deepcopy(parent)
+    history: Final = responses_compaction_history_metadata(parent)
+    assert _get_budget_reservation_from_metadata(history) is None
+    assert _get_budget_reservation_from_metadata(parent) is reservation
+    assert history[INTERNAL_CALL_ORIGIN_METADATA_KEY] == RESPONSES_COMPACTION_CALL_ORIGIN
+    assert history["user_api_key"] == "test-key"
+    assert history["routing_decision"] == "selected-deployment"
+    assert parent == before
+
+
+@pytest.mark.parametrize("call_type", ["get_responses", "aget_responses", "list_input_items", "alist_input_items"])
+def test_trusted_history_read_suppresses_old_background_usage_but_not_inference(call_type: str) -> None:
+    history: Final = responses_compaction_history_metadata(None)
+    copied: Final = deepcopy(history)
+    response: Final = {"background": True, "usage": {"input_tokens": 1234, "output_tokens": 56}}
+    assert is_unbilled_non_inference_call(call_type, copied, response)
+    assert is_unbilled_non_inference_call_from_params(call_type, {"litellm_metadata": copied}, response)
+    assert not is_unbilled_non_inference_call("aresponses", copied, response)
+    assert not is_unbilled_non_inference_call("acompletion", copied, response)
+    assert not is_unbilled_non_inference_call(call_type, None, response)
+
+
+@pytest.mark.parametrize("forged_marker", [None, {}, True, "trusted", []])
+def test_public_json_cannot_forge_compaction_history_cost_suppression(forged_marker: object) -> None:
+    forged: Final = {
+        **dict.fromkeys(responses_compaction_history_metadata(None), forged_marker),
+        INTERNAL_CALL_ORIGIN_METADATA_KEY: RESPONSES_COMPACTION_CALL_ORIGIN,
+    }
+    assert not is_unbilled_non_inference_call("aget_responses", forged, {"background": True})
+
+
+def test_history_marker_loses_authority_on_json_roundtrip_and_public_polling_still_bills() -> None:
+    adapter: Final = TypeAdapter(dict[str, object])
+    trusted: Final = responses_compaction_history_metadata({"user_api_key": "test-key"})
+    public: Final = adapter.validate_json(adapter.dump_json(trusted))
+    assert is_unbilled_non_inference_call("aget_responses", trusted, {"background": True})
+    assert not is_unbilled_non_inference_call("aget_responses", public, {"background": True})
+    assert not is_unbilled_non_inference_call(
+        "aget_responses", {INTERNAL_CALL_ORIGIN_METADATA_KEY: RESPONSES_COMPACTION_CALL_ORIGIN}, {"background": True}
+    )
+    assert not is_unbilled_non_inference_call(
+        "aget_responses", {INTERNAL_CALL_ORIGIN_METADATA_KEY: BACKGROUND_RESPONSE_COST_POLL_CALL_ORIGIN}, {}
+    )
+    assert is_unbilled_non_inference_call("aget_responses", None, {"background": False})

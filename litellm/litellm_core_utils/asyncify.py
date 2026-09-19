@@ -68,7 +68,11 @@ def asyncify(
     return wrapper
 
 
-def run_async_function(async_function, *args, **kwargs):
+def run_async_function(
+    async_function: Callable[T_ParamSpec, Awaitable[T_Retval]],
+    *args: T_ParamSpec.args,
+    **call_kwargs: T_ParamSpec.kwargs,  # kwargs-ok: forwards the wrapped callable's exact parameter specification
+) -> T_Retval:
     """
     Helper utility to run an async function in a sync context.
     Handles the case where there is an existing event loop running.
@@ -91,12 +95,12 @@ def run_async_function(async_function, *args, **kwargs):
     """
     from concurrent.futures import ThreadPoolExecutor
 
-    def run_in_new_loop():
+    def run_in_new_loop() -> T_Retval:
         """Run the coroutine in a new event loop within this thread."""
         new_loop: Final = asyncio.new_event_loop()
         try:
             asyncio.set_event_loop(new_loop)
-            return new_loop.run_until_complete(async_function(*args, **kwargs))
+            return new_loop.run_until_complete(async_function(*args, **call_kwargs))
         finally:
             new_loop.close()
             asyncio.set_event_loop(None)

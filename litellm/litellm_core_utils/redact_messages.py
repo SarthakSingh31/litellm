@@ -121,6 +121,11 @@ def _redact_choice_content(choice):
 def _redact_responses_api_output(output_items):
     """Helper to redact ResponsesAPIResponse output items."""
     for output_item in output_items:
+        if isinstance(output_item, dict):
+            _redact_responses_api_output_dict((output_item,), REDACTED_BY_LITELLM)
+            continue
+        if getattr(output_item, "type", None) == "compaction" and hasattr(output_item, "encrypted_content"):
+            output_item.encrypted_content = REDACTED_BY_LITELLM
         if getattr(output_item, "text", None) is not None:
             output_item.text = REDACTED_BY_LITELLM
 
@@ -150,6 +155,8 @@ def _redact_responses_api_output_dict(output_items, redacted_str: str):
         if not isinstance(output_item, dict):
             continue
 
+        if output_item.get("type") == "compaction" and "encrypted_content" in output_item:
+            output_item["encrypted_content"] = redacted_str
         if output_item.get("text") is not None:
             output_item["text"] = redacted_str
 

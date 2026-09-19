@@ -1,12 +1,21 @@
 import asyncio
 import json
-from typing import TYPE_CHECKING, Any, Final, cast
+from collections.abc import Mapping, Sequence
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Any, Final, TypeAlias, cast
+
+from pydantic import BaseModel, ConfigDict, JsonValue, TypeAdapter, field_validator
 
 import litellm
 from litellm._logging import verbose_proxy_logger
-from litellm.constants import REDACTED_BY_LITELLM, REDACTED_TOOL_CALL_ARGUMENTS_PLACEHOLDER
+from litellm.constants import (
+    LITELLM_TRUNCATED_PAYLOAD_FIELD,
+    REDACTED_BY_LITELLM,
+    REDACTED_TOOL_CALL_ARGUMENTS_PLACEHOLDER,
+)
 from litellm.proxy._types import SpendLogsMetadata, SpendLogsPayload
 from litellm.proxy.spend_tracking.cold_storage_handler import ColdStorageHandler
+from litellm.responses.compaction_history import replay_compaction_input
 from litellm.responses.utils import ResponsesAPIRequestUtils
 from litellm.types.llms.openai import (
     AllMessageValues,
@@ -29,6 +38,69 @@ else:
 COLD_STORAGE_HANDLER: Final = ColdStorageHandler()
 ########################################################
 
+_MAX_COMPACTION_ANCESTRY: Final = 256
+_INPUT_ADAPTER: Final[TypeAdapter[str | ResponseInputParam]] = TypeAdapter(str | ResponseInputParam)
+_JSON_ADAPTER: Final[TypeAdapter[JsonValue]] = TypeAdapter(JsonValue)
+_JSON_OBJECT_ADAPTER: Final = TypeAdapter(Mapping[str, JsonValue])
+_RESPONSE_OBJECT: Final = "response"
+_EMPTY_OBJECT: Final[Mapping[str, JsonValue]] = MappingProxyType({})
+_ChatHistoryItem: TypeAlias = (
+    AllMessageValues
+    | GenericChatCompletionMessage
+    | ChatCompletionMessageToolCall
+    | ChatCompletionResponseMessage
+    | Message
+)
+
+
+class _StoredResponseBody(BaseModel):
+    model_config = ConfigDict(extra="allow", strict=True)
+
+    input: str | ResponseInputParam
+    previous_response_id: str | None = None
+    instructions: str | None = None
+
+    @field_validator("input")
+    @classmethod
+    def materialize_input(cls, value: str | ResponseInputParam) -> str | ResponseInputParam:
+        return _materialized_input(value)
+
+
+class _StoredReplayRow(BaseModel):
+    request_id: str
+    session_id: str | None = None
+    proxy_server_request: str | Mapping[str, JsonValue] | None = None
+    response: JsonValue = None
+    metadata: str | Mapping[str, JsonValue] | None = None
+
+
+_REPLAY_ROWS_ADAPTER: Final = TypeAdapter(tuple[_StoredReplayRow, ...])
+
+
+def _materialized_input(value: object) -> str | ResponseInputParam:
+    validated: Final = _INPUT_ADAPTER.validate_python(value)
+    return cast(  # cast-ok: SDK validation precedes materialization of Iterable fields to JSON lists
+        str | ResponseInputParam, _INPUT_ADAPTER.dump_python(validated, mode="json")
+    )
+
+
+def _has_unavailable_content(value: JsonValue) -> bool:
+    if isinstance(value, str):
+        return REDACTED_BY_LITELLM in value or LITELLM_TRUNCATED_PAYLOAD_FIELD in value
+    if isinstance(value, list):
+        return any(_has_unavailable_content(item) for item in value)
+    if isinstance(value, dict):
+        return LITELLM_TRUNCATED_PAYLOAD_FIELD in value or any(
+            _has_unavailable_content(item) for item in value.values()
+        )
+    return False
+
+
+def _stored_output(spend_log: Mapping[str, object]) -> Mapping[str, JsonValue]:
+    raw: Final = spend_log.get("response")
+    parsed: Final = _JSON_ADAPTER.validate_json(raw) if isinstance(raw, str) else _JSON_ADAPTER.validate_python(raw)
+    return _JSON_OBJECT_ADAPTER.validate_python(parsed) if parsed is not None else _EMPTY_OBJECT
+
 
 def _normalize_redacted_tool_call_arguments(message: Message) -> None:
     """Redaction stores the bare sentinel (invalid JSON) in tool-call arguments;
@@ -45,6 +117,8 @@ class ResponsesSessionHandler:
     @staticmethod
     async def get_chat_completion_message_history_for_previous_response_id(
         previous_response_id: str,
+        *,
+        compaction_ancestry_only: bool = False,
     ) -> ChatCompletionSession:
         """
         Return the chat completion message history for a previous response id
@@ -54,9 +128,11 @@ class ResponsesSessionHandler:
         )
 
         verbose_proxy_logger.debug("inside get_chat_completion_message_history_for_previous_response_id")
-        all_spend_logs: list[
-            SpendLogsPayload
-        ] = await ResponsesSessionHandler.get_all_spend_logs_for_previous_response_id(previous_response_id)
+        all_spend_logs: Final = (
+            await ResponsesSessionHandler.get_compaction_ancestry(previous_response_id)
+            if compaction_ancestry_only
+            else await ResponsesSessionHandler.get_all_spend_logs_for_previous_response_id(previous_response_id)
+        )
         verbose_proxy_logger.debug("found %s spend logs for this response id", len(all_spend_logs))
 
         litellm_session_id: str | None = None
@@ -88,16 +164,64 @@ class ResponsesSessionHandler:
         )
 
     @staticmethod
+    async def get_compaction_ancestry(
+        previous_response_id: str,
+        *,
+        _visited: frozenset[str] = frozenset(),
+    ) -> tuple[SpendLogsPayload, ...]:
+        from litellm.proxy.proxy_server import prisma_client
+
+        if prisma_client is None:
+            raise ValueError("Gateway compaction needs stored response history or full client input replay")
+        decoded: Final = ResponsesAPIRequestUtils._decode_responses_api_response_id(  # pyright: ignore[reportPrivateUsage]  # reuse the existing response affinity decoder
+            previous_response_id
+        )
+        response_id: Final = decoded.get("response_id", previous_response_id)
+        if response_id in _visited:
+            raise ValueError("Invalid cycle in stored previous_response_id history")
+        if len(_visited) >= _MAX_COMPACTION_ANCESTRY:
+            raise ValueError("Stored response ancestry exceeds the replay limit; replay the complete input")
+        rows: Final = _REPLAY_ROWS_ADAPTER.validate_python(
+            await prisma_client.db.query_raw(  # pyright: ignore[reportAny]  # generated Prisma raw-query result is validated here
+                'SELECT * FROM "LiteLLM_SpendLogs" WHERE request_id = $1 ORDER BY "endTime" DESC LIMIT 1',
+                response_id,
+            )
+        )
+        if not rows:
+            raise ValueError("Previous response history is not stored yet; retry or replay the complete input")
+        row: Final = cast(  # cast-ok: validated replay fields consumed by legacy session helpers
+            SpendLogsPayload, rows[0].model_dump()
+        )
+        body: Final = _StoredResponseBody.model_validate(
+            await ResponsesSessionHandler.get_proxy_server_request_from_spend_log(row)  # pyright: ignore[reportUnknownMemberType]  # legacy cold-storage result is validated here
+        )
+        if not body.input:
+            raise ValueError("Previous response input was not retained; replay the complete input for compaction")
+        output: Final = _stored_output(row)
+        if not output or not ("choices" in output or "output" in output):
+            raise ValueError("Previous response output was not retained; replay the complete input for compaction")
+        if _has_unavailable_content(_JSON_ADAPTER.validate_python(body.model_dump())) or _has_unavailable_content(
+            _JSON_ADAPTER.validate_python(output)
+        ):
+            raise ValueError(
+                "Stored response history is redacted or truncated; replay the complete input for compaction"
+            )
+        previous_input: Final = body.input
+        if replay_compaction_input(previous_input) is not previous_input:
+            return (row,)
+        parent: Final = body.previous_response_id
+        if not parent:
+            return (row,)
+        ancestors: Final = await ResponsesSessionHandler.get_compaction_ancestry(
+            parent, _visited=_visited | frozenset((response_id,))
+        )
+        return (*ancestors, row)
+
+    @staticmethod
     async def extend_chat_completion_message_with_spend_log_payload(
         spend_log: SpendLogsPayload,
-        chat_completion_message_history: list[
-            AllMessageValues
-            | GenericChatCompletionMessage
-            | ChatCompletionMessageToolCall
-            | ChatCompletionResponseMessage
-            | Message
-        ],
-    ):
+        chat_completion_message_history: Sequence[_ChatHistoryItem],
+    ) -> list[_ChatHistoryItem]:  # mutable-ok: existing session API returns JSON messages
         """
         Extend the chat completion message history with the spend log payload
         """
@@ -105,59 +229,50 @@ class ResponsesSessionHandler:
             LiteLLMCompletionResponsesConfig,
         )
 
-        proxy_server_request_dict: Final = await ResponsesSessionHandler.get_proxy_server_request_from_spend_log(
-            spend_log=spend_log,
+        request: Final = _JSON_OBJECT_ADAPTER.validate_python(
+            await ResponsesSessionHandler.get_proxy_server_request_from_spend_log(  # pyright: ignore[reportUnknownMemberType]  # legacy cold-storage result is validated here
+                spend_log=spend_log,
+            )
+            or _EMPTY_OBJECT
         )
-        response_input_param: str | ResponseInputParam | None = None
-        _messages: str | ResponseInputParam | None = None
-
-        ############################################################
-        # Add Input messages for this Spend Log
-        ############################################################
-        if proxy_server_request_dict:
-            _response_input_param: Final = proxy_server_request_dict.get("input", None)
-            _messages = proxy_server_request_dict.get("messages", None)
-            if isinstance(_response_input_param, (str, list)):
-                response_input_param = _response_input_param
-            elif isinstance(_response_input_param, dict):
-                response_input_param = cast(
-                    ResponseInputParam,
-                    [_response_input_param],  # mutable-ok: a lone input item still has to arrive as a list
-                )
-
-        if response_input_param:
-            chat_completion_messages = LiteLLMCompletionResponsesConfig.transform_responses_api_input_to_messages(
-                input=response_input_param,
-                responses_api_request=proxy_server_request_dict or {},
+        request_for_conversion: Final = dict(request)  # mutable-ok: existing converter accepts JSON request dicts
+        raw_input: Final = request.get("input") or request.get("messages")
+        response_input: Final = (
+            _materialized_input(
+                [raw_input]  # mutable-ok: lone Responses item uses a JSON list
+                if isinstance(raw_input, dict)
+                else raw_input
+            )
+            if raw_input
+            else None
+        )
+        replayed: Final = replay_compaction_input(response_input) if response_input is not None else None
+        prior: Final = () if replayed is not response_input else tuple(chat_completion_message_history)
+        input_messages: Final = (
+            LiteLLMCompletionResponsesConfig.transform_responses_api_input_to_messages(  # pyright: ignore[reportUnknownMemberType]  # legacy converter carries partially typed request annotations
+                input=replayed, responses_api_request=request_for_conversion, replay_reasoning=True
+            )
+            if replayed is not None
+            else ()
+        )
+        output: Final = _stored_output(spend_log)
+        if output.get("object") == _RESPONSE_OBJECT or "output" in output:
+            output_messages: Final = LiteLLMCompletionResponsesConfig.transform_responses_api_input_to_messages(  # pyright: ignore[reportUnknownMemberType]  # legacy converter carries partially typed request annotations
+                input=_materialized_input(output.get("output")),
+                responses_api_request={},  # mutable-ok: existing converter accepts JSON request dicts
                 replay_reasoning=True,
             )
-            chat_completion_message_history.extend(chat_completion_messages)
-
-        ############################################################
-        # Check if `messages` field is present in the proxy server request dict
-        ############################################################
-        elif _messages:
-            # ensure all messages are /chat/completions/messages
-            # certain requests can be stored as Responses API format - this ensures they are transformed to /chat/completions/messages
-            chat_completion_messages = LiteLLMCompletionResponsesConfig.transform_responses_api_input_to_messages(
-                input=_messages,
-                responses_api_request=proxy_server_request_dict or {},
-                replay_reasoning=True,
-            )
-            chat_completion_message_history.extend(chat_completion_messages)
-
-        ############################################################
-        # Add Output messages for this Spend Log
-        ############################################################
-        _response_output: Final = spend_log.get("response", "{}")
-        if isinstance(_response_output, dict) and _response_output and _response_output != {}:
-            # transform `ChatCompletion Response` to `ResponsesAPIResponse`
-            model_response: Final = ModelResponse(**_response_output)
-            for choice in model_response.choices:
-                if hasattr(choice, "message"):
-                    _normalize_redacted_tool_call_arguments(choice.message)
-                    chat_completion_message_history.append(choice.message)
-        return chat_completion_message_history
+            return [*prior, *input_messages, *output_messages]  # mutable-ok: existing session API returns JSON messages
+        model_response: Final = ModelResponse.model_validate(output) if output else None
+        choices: Final = tuple(model_response.choices) if model_response is not None else ()
+        for choice in choices:
+            if hasattr(choice, "message"):
+                _normalize_redacted_tool_call_arguments(choice.message)
+        return [  # mutable-ok: existing session API returns JSON messages
+            *prior,
+            *input_messages,
+            *(choice.message for choice in choices if hasattr(choice, "message")),
+        ]
 
     @staticmethod
     async def get_proxy_server_request_from_spend_log(

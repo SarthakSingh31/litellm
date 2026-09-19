@@ -252,3 +252,36 @@ async def test_mode_responses_chat_completion_reaches_native_responses(monkeypat
     assert chat_route.call_count == 0
     assert isinstance(result, ModelResponse)
     assert result.choices[0].message.content == "native"
+
+
+@respx.mock
+async def test_declared_native_endpoint_supports_history_reads():
+    get_route = respx.get(f"{RESPONSES_URL}/resp_native").respond(200, json=RESPONSES_BODY)
+    input_items = {
+        "object": "list",
+        "data": [{"type": "message", "role": "user", "content": "prior input"}],
+        "has_more": False,
+    }
+    list_route = respx.get(f"{RESPONSES_URL}/resp_native/input_items").respond(200, json=input_items)
+
+    response = await litellm.aget_responses(
+        response_id="resp_native",
+        api_base=API_BASE,
+        api_key="sk-backend",
+        custom_llm_provider="custom_openai",
+        model_info=OPT_IN,
+    )
+    history = await litellm.alist_input_items(
+        response_id="resp_native",
+        api_base=API_BASE,
+        api_key="sk-backend",
+        custom_llm_provider="custom_openai",
+        model_info=OPT_IN,
+        order="asc",
+    )
+
+    assert response.output_text == "native"
+    assert history["data"] == input_items["data"]
+    assert get_route.call_count == list_route.call_count == 1
+    assert get_route.calls[0].request.headers["authorization"] == "Bearer sk-backend"
+    assert list_route.calls[0].request.headers["authorization"] == "Bearer sk-backend"

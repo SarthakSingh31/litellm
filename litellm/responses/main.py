@@ -505,7 +505,7 @@ class _AsyncPromptManagementOutcome:
 
 
 def _resolve_responses_api_provider_config(
-    model: str, custom_llm_provider: str, model_info: object, api_base: str | None
+    model: str | None, custom_llm_provider: str, model_info: object, api_base: str | None
 ) -> BaseResponsesAPIConfig | None:
     provider_config: Final = ProviderConfigManager.get_provider_responses_api_config(
         model=model, provider=custom_llm_provider, api_base=api_base
@@ -1701,12 +1701,11 @@ def get_responses(
             raise ValueError("custom_llm_provider is required but passed as None")
 
         # get provider config
-        responses_api_provider_config: Final[BaseResponsesAPIConfig | None] = (
-            ProviderConfigManager.get_provider_responses_api_config(
-                model=None,
-                provider=custom_llm_provider,
-                api_base=litellm_params.api_base,
-            )
+        responses_api_provider_config: Final[BaseResponsesAPIConfig | None] = _resolve_responses_api_provider_config(
+            model=None,
+            custom_llm_provider=custom_llm_provider,
+            model_info=kwargs.get("model_info"),
+            api_base=litellm_params.api_base,
         )
 
         if responses_api_provider_config is None:
@@ -1846,12 +1845,11 @@ def list_input_items(
         if custom_llm_provider is None:
             raise ValueError("custom_llm_provider is required but passed as None")
 
-        responses_api_provider_config: Final[BaseResponsesAPIConfig | None] = (
-            ProviderConfigManager.get_provider_responses_api_config(
-                model=None,
-                provider=custom_llm_provider,
-                api_base=litellm_params.api_base,
-            )
+        responses_api_provider_config: Final[BaseResponsesAPIConfig | None] = _resolve_responses_api_provider_config(
+            model=None,
+            custom_llm_provider=custom_llm_provider,
+            model_info=kwargs.get("model_info"),
+            api_base=litellm_params.api_base,
         )
 
         if responses_api_provider_config is None:

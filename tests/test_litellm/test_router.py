@@ -16919,3 +16919,275 @@ class TestMemberAutoRouterInference:
         monkeypatch.setitem(sys.modules, "fastapi", None)
         monkeypatch.delitem(sys.modules, "litellm.proxy.auth.auto_router_checks", raising=False)
         assert (await self._route(router, {"metadata": {"user_api_key_team_id": "router-team"}})).model == "restricted-model"
+
+
+class _CompactionRouterProvider:
+    def __init__(self, router: Router, failures: int = 0, *, summary_failure: bool = False) -> None:
+        self.router = router
+        self.failures = failures
+        self.summary_failure = summary_failure
+        self.calls: tuple[Mapping[str, object], ...] = ()
+        self.main_attempts = 0
+
+    async def __call__(self, **kwargs: object):
+        from litellm.responses.compaction import COMPACTION_CHILD_KEY
+        from litellm.router_utils.pre_call_checks.io_token_rate_limit_check import (
+            get_io_token_rate_limit_request_kwargs,
+        )
+        from litellm.types.llms.openai import ResponseAPIUsage, ResponsesAPIResponse
+
+        self.calls = (*self.calls, kwargs)
+        metadata: Final = kwargs["litellm_metadata"]
+        assert isinstance(metadata, dict)
+        deployment_id: Final = metadata["model_info"]["id"]
+        slot: Final = self.router.cache.get_cache(key=f"{deployment_id}_max_parallel_requests_client", local_only=True)
+        assert isinstance(slot, MaxParallelRequestsLimit)
+        assert slot.in_flight == 1
+        token_request: Final = get_io_token_rate_limit_request_kwargs()
+        assert token_request is not None and token_request["input"] == kwargs["input"]
+        child: Final = kwargs.get(COMPACTION_CHILD_KEY) is True
+        if child and self.summary_failure:
+            raise litellm.InternalServerError(
+                message="summary failed after admission", model=str(kwargs["model"]), llm_provider="openai"
+            )
+        if not child:
+            self.main_attempts += 1
+            if self.main_attempts <= self.failures:
+                raise litellm.InternalServerError(
+                    message="retry the selected deployment", model=str(kwargs["model"]), llm_provider="openai"
+                )
+        return ResponsesAPIResponse(
+            id=f"resp_compaction_{len(self.calls)}",
+            model=str(kwargs["model"]),
+            created_at=0,
+            output=[
+                {
+                    "type": "message",
+                    "id": "msg_fixture",
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": "<summary>earlier work</summary>" if child else "done",
+                            "annotations": [],
+                        }
+                    ],
+                }
+            ],
+            usage=ResponseAPIUsage(input_tokens=7, output_tokens=3, total_tokens=10),
+        )
+
+
+def _compaction_router_fixture(*, retries: int = 0) -> Router:
+    return Router(
+        model_list=[
+            {
+                "model_name": group,
+                "litellm_params": {
+                    "model": f"openai/{group}",
+                    "api_key": f"key-{group}",
+                    "api_base": f"https://{group}.invalid/v1",
+                    "max_parallel_requests": 1,
+                    "itpm": 1000000,
+                    "otpm": 1000000,
+                },
+                "model_info": {
+                    "id": group,
+                    "max_input_tokens": 100000,
+                    "max_output_tokens": 1024,
+                    "supports_native_compaction": False,
+                },
+            }
+            for group in ("compaction-primary", "compaction-fallback")
+        ],
+        num_retries=retries,
+        retry_after=0,
+        disable_cooldowns=True,
+        fallbacks=[{"compaction-primary": ["compaction-fallback"]}],
+    )
+
+
+@pytest.mark.asyncio
+async def test_responses_compaction_uses_separate_slots_and_reuses_summary_on_retry(monkeypatch: pytest.MonkeyPatch):
+    from litellm.proxy.proxy_server import general_settings
+    from litellm.responses.compaction import COMPACTION_CHILD_KEY
+    from litellm.types.llms.openai import ResponsesAPIResponse
+
+    router: Final = _compaction_router_fixture(retries=1)
+    provider: Final = _CompactionRouterProvider(router, failures=1)
+    monkeypatch.setitem(general_settings, "context_management_summary_model", "same_as_request")
+    response: Final = await router._aresponses_with_streaming_fallbacks(
+        original_function=provider,
+        model="compaction-primary",
+        input=[
+            {"role": "user", "content": "earlier task"},
+            {"role": "assistant", "content": "earlier result"},
+            {"role": "user", "content": "current task"},
+        ],
+        context_management=[{"type": "compaction", "compact_threshold": 1}],
+    )
+    assert isinstance(response, ResponsesAPIResponse)
+    assert response.usage is not None and response.usage.total_tokens == 20
+    assert len(provider.calls) == 3
+    assert sum(call.get(COMPACTION_CHILD_KEY) is True for call in provider.calls) == 1
+    assert {call["model"] for call in provider.calls} == {"openai/compaction-primary"}
+    assert {call["api_key"] for call in provider.calls} == {"key-compaction-primary"}
+    assert {call["api_base"] for call in provider.calls} == {"https://compaction-primary.invalid/v1"}
+    assert provider.calls[1]["input"] == provider.calls[2]["input"]
+    assert provider.calls[0]["input"] != provider.calls[1]["input"]
+    slot: Final = router.cache.get_cache(key="compaction-primary_max_parallel_requests_client", local_only=True)
+    assert isinstance(slot, MaxParallelRequestsLimit) and slot.in_flight == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("compact", [True, False])
+async def test_responses_compaction_stops_fallback_only_after_summary(compact: bool, monkeypatch: pytest.MonkeyPatch):
+    from litellm.proxy.proxy_server import general_settings
+    from litellm.responses.compaction import COMPACTION_CHILD_KEY
+
+    router: Final = _compaction_router_fixture()
+    provider: Final = _CompactionRouterProvider(router, failures=1)
+    request: Final = {
+        "model": "compaction-primary",
+        "input": [
+            {"role": "user", "content": "old task"},
+            {"role": "assistant", "content": "old result"},
+            {"role": "user", "content": "new task"},
+        ],
+        **({"context_management": [{"type": "compaction", "compact_threshold": 1}]} if compact else {}),
+    }
+    monkeypatch.setitem(general_settings, "context_management_summary_model", "same_as_request")
+    if compact:
+        with pytest.raises(litellm.InternalServerError, match="retry the selected deployment"):
+            await router._aresponses_with_streaming_fallbacks(original_function=provider, **request)
+        assert {call["model"] for call in provider.calls} == {"openai/compaction-primary"}
+        assert sum(call.get(COMPACTION_CHILD_KEY) is True for call in provider.calls) == 1
+    else:
+        response: Final = await router._aresponses_with_streaming_fallbacks(original_function=provider, **request)
+        assert response.model == "openai/compaction-fallback"
+        assert all(call.get(COMPACTION_CHILD_KEY) is not True for call in provider.calls)
+
+
+@pytest.mark.asyncio
+async def test_compaction_pinned_deployment_still_runs_budget_filter(monkeypatch: pytest.MonkeyPatch):
+    from litellm.types.router import RouterRateLimitError
+
+    class ExhaustedDeployment(CustomLogger):
+        async def async_filter_deployments(self, model, healthy_deployments, **kwargs):
+            return []
+
+    router: Final = _compaction_router_fixture()
+    deployment: Final = router.get_deployment("compaction-primary")
+    assert deployment is not None
+    monkeypatch.setattr(litellm, "callbacks", [ExhaustedDeployment()])
+    with pytest.raises(RouterRateLimitError):
+        await router.async_get_healthy_deployments(
+            model="compaction-primary",
+            request_kwargs={},
+            input="summary",
+            _compaction_deployment=deployment.model_dump(exclude_none=True),
+        )
+
+
+@pytest.mark.asyncio
+async def test_compaction_pinned_deployment_cannot_bypass_residency():
+    from litellm.types.router import RouterRateLimitError
+
+    router: Final = _compaction_router_fixture()
+    deployment: Final = router.get_deployment("compaction-primary")
+    assert deployment is not None
+    with pytest.raises(RouterRateLimitError):
+        await router.async_get_healthy_deployments(
+            model="compaction-primary",
+            request_kwargs={"allowed_model_region": "required-test-region"},
+            input="summary",
+            _compaction_deployment=deployment.model_dump(exclude_none=True),
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("admission_gate", ["filter", "slot"])
+async def test_responses_compaction_admission_denial_allows_fallback(
+    admission_gate: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from litellm.proxy.proxy_server import general_settings
+    from litellm.responses.compaction import COMPACTION_CHILD_KEY
+    from litellm.router_utils.pre_call_checks.io_token_rate_limit_check import get_io_token_rate_limit_request_kwargs
+    from litellm.types.llms.openai import ResponsesAPIResponse
+
+    def is_primary_summary(request: Mapping[str, object] | None) -> bool:
+        return (
+            request is not None
+            and request.get(COMPACTION_CHILD_KEY) is True
+            and request.get("model") == "openai/compaction-primary"
+        )
+
+    class SummaryAdmission(CustomLogger):
+        async def async_filter_deployments(
+            self,
+            model: str,
+            healthy_deployments: list[dict[str, object]],
+            request_kwargs: dict[str, object] | None = None,
+            **kwargs: object,
+        ) -> list[dict[str, object]]:
+            if admission_gate == "filter" and is_primary_summary(request_kwargs):
+                return []
+            return healthy_deployments
+
+        async def async_pre_call_check(self, deployment: Mapping[str, object], parent_otel_span: object) -> None:
+            if admission_gate == "slot" and is_primary_summary(get_io_token_rate_limit_request_kwargs()):
+                raise litellm.RateLimitError(
+                    message="summary denied before provider admission", model="compaction-primary", llm_provider=""
+                )
+
+    router: Final = _compaction_router_fixture()
+    provider: Final = _CompactionRouterProvider(router)
+    monkeypatch.setattr(litellm, "callbacks", [SummaryAdmission()])
+    monkeypatch.setitem(general_settings, "context_management_summary_model", "same_as_request")
+    response: Final = await router._aresponses_with_streaming_fallbacks(
+        original_function=provider,
+        model="compaction-primary",
+        input=[
+            {"role": "user", "content": "old task"},
+            {"role": "assistant", "content": "old result"},
+            {"role": "user", "content": "new task"},
+        ],
+        context_management=[{"type": "compaction", "compact_threshold": 1}],
+    )
+    assert isinstance(response, ResponsesAPIResponse)
+    assert response.model == "openai/compaction-fallback"
+    assert response.usage is not None and response.usage.total_tokens == 20
+    assert len(provider.calls) == 2
+    assert {call["model"] for call in provider.calls} == {"openai/compaction-fallback"}
+    assert provider.calls[0].get(COMPACTION_CHILD_KEY) is True
+    assert provider.calls[1].get(COMPACTION_CHILD_KEY) is not True
+    primary_slot: Final = router.cache.get_cache(key="compaction-primary_max_parallel_requests_client", local_only=True)
+    assert primary_slot is None or (isinstance(primary_slot, MaxParallelRequestsLimit) and primary_slot.in_flight == 0)
+
+
+@pytest.mark.asyncio
+async def test_responses_compaction_provider_failure_after_admission_stays_locked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from litellm.proxy.proxy_server import general_settings
+    from litellm.responses.compaction import COMPACTION_CHILD_KEY
+
+    router: Final = _compaction_router_fixture()
+    provider: Final = _CompactionRouterProvider(router, summary_failure=True)
+    monkeypatch.setitem(general_settings, "context_management_summary_model", "same_as_request")
+    with pytest.raises(litellm.InternalServerError, match="summary failed after admission"):
+        await router._aresponses_with_streaming_fallbacks(
+            original_function=provider,
+            model="compaction-primary",
+            input=[
+                {"role": "user", "content": "old task"},
+                {"role": "assistant", "content": "old result"},
+                {"role": "user", "content": "new task"},
+            ],
+            context_management=[{"type": "compaction", "compact_threshold": 1}],
+        )
+    assert len(provider.calls) == 1
+    assert provider.calls[0]["model"] == "openai/compaction-primary"
+    assert provider.calls[0].get(COMPACTION_CHILD_KEY) is True
+    assert provider.main_attempts == 0

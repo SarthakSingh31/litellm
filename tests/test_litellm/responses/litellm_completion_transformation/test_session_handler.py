@@ -1,4 +1,7 @@
 import json
+from collections.abc import Callable
+from types import SimpleNamespace
+from typing import Final
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -6,6 +9,7 @@ from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 import litellm
+from litellm.responses.compaction_history import create_compaction_item
 from litellm.responses.litellm_completion_transformation import session_handler
 from litellm.responses.litellm_completion_transformation.session_handler import (
     ResponsesSessionHandler,
@@ -13,6 +17,171 @@ from litellm.responses.litellm_completion_transformation.session_handler import 
 )
 from litellm.responses.utils import ResponsesAPIRequestUtils
 from litellm.types.utils import Message
+
+
+@pytest.fixture
+def install_replay_prisma(monkeypatch: pytest.MonkeyPatch) -> Callable[[object], None]:
+    def install(client: object) -> None:
+        monkeypatch.setattr(  # test-quality-ok: module-owned Prisma singleton is the legacy persistence injection boundary
+            "litellm.proxy.proxy_server.prisma_client", client
+        )
+
+    return install
+
+
+def _saved_response_snapshot(
+    request_id: str, body: dict[str, object], response: object | None = None
+) -> dict[str, object]:
+    return {
+        "request_id": request_id,
+        "session_id": "original-trace-id",
+        "proxy_server_request": json.dumps(body),
+        "response": json.dumps(response if response is not None else _chat_completion_response(request_id, request_id)),
+    }
+
+
+@pytest.mark.asyncio
+async def test_compaction_ancestry_replays_saved_artifact_without_siblings_or_superseded_history(
+    install_replay_prisma: Callable[[object], None],
+) -> None:
+    artifact: Final = create_compaction_item(
+        "Preserved earlier work",
+        [
+            {"role": "system", "content": "Retained system policy"},
+            {"role": "developer", "content": "Retained developer policy"},
+            {"role": "user", "content": "Active original task"},
+        ],
+    )
+    saved: Final = {
+        "compacted": _saved_response_snapshot(
+            "compacted",
+            {
+                "input": [json.loads(artifact.model_dump_json())],
+                "previous_response_id": "obsolete",
+                "instructions": "Current instructions",
+                "litellm_trace_id": "original-trace-id",
+            },
+        ),
+        "next": _saved_response_snapshot(
+            "next", {"input": "Continue the active task", "previous_response_id": "compacted"}
+        ),
+        "sibling": _saved_response_snapshot(
+            "sibling", {"input": "Unrelated branch", "previous_response_id": "compacted"}
+        ),
+        "obsolete": _saved_response_snapshot("obsolete", {"input": "Superseded transcript"}),
+    }
+    original: Final = json.dumps(saved)
+
+    async def query_row(query: str, response_id: str) -> list[dict[str, object]]:
+        return [saved[response_id]] if response_id in saved else []
+
+    query: Final = AsyncMock(side_effect=query_row)
+    client: Final = SimpleNamespace(db=SimpleNamespace(query_raw=query))
+    wrapped: Final = ResponsesAPIRequestUtils._build_responses_api_response_id(
+        custom_llm_provider="anthropic", model_id="fixture-deployment", response_id="next"
+    )
+    install_replay_prisma(client)
+    result: Final = await ResponsesSessionHandler.get_chat_completion_message_history_for_previous_response_id(
+        wrapped, compaction_ancestry_only=True
+    )
+
+    contents: Final = [message.get("content") for message in result["messages"]]
+    assert [call.args[1] for call in query.await_args_list] == ["next", "compacted"]
+    assert any("Preserved earlier work" in str(content) for content in contents)
+    assert "Retained system policy" in contents
+    assert "Retained developer policy" in contents
+    assert "Current instructions" in contents
+    assert "Active original task" in contents
+    assert contents[-3:] == ["compacted", "Continue the active task", "next"]
+    assert "Unrelated branch" not in contents
+    assert "Superseded transcript" not in contents
+    assert result["litellm_session_id"] == "original-trace-id"
+    assert json.dumps(saved) == original
+
+
+@pytest.mark.asyncio
+async def test_compaction_snapshot_resets_accumulated_history_and_replays_native_response_output() -> None:
+    artifact: Final = create_compaction_item("Earlier summary", [{"role": "user", "content": "Current task"}])
+    row: Final = _saved_response_snapshot(
+        "native-output",
+        {"input": [json.loads(artifact.model_dump_json())], "instructions": "Keep current instructions"},
+        {
+            "object": "response",
+            "output": [
+                {
+                    "type": "message",
+                    "id": "message-1",
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": [{"type": "output_text", "text": "Native output survives", "annotations": []}],
+                },
+                {"type": "function_call", "call_id": "call-1", "name": "lookup", "arguments": "{}"},
+            ],
+        },
+    )
+    prior: Final = [{"role": "user", "content": "Superseded history"}]
+    result: Final = await ResponsesSessionHandler.extend_chat_completion_message_with_spend_log_payload(row, prior)
+    assert prior == [{"role": "user", "content": "Superseded history"}]
+    assert "Superseded history" not in str(result)
+    assert "Earlier summary" in str(result)
+    assert "Native output survives" in str(result)
+    assert "call-1" in str(result)
+    assert result[0].get("content") == "Keep current instructions"
+
+
+@pytest.mark.asyncio
+async def test_compaction_ancestry_rejects_multi_hop_cycles_with_wrapped_ids(
+    install_replay_prisma: Callable[[object], None],
+) -> None:
+    encoded_first: Final = ResponsesAPIRequestUtils._build_responses_api_response_id(
+        custom_llm_provider="anthropic", model_id="fixture-deployment", response_id="first"
+    )
+    first: Final = _saved_response_snapshot("first", {"input": "one", "previous_response_id": "second"})
+    second: Final = _saved_response_snapshot("second", {"input": "two", "previous_response_id": "third"})
+    third: Final = _saved_response_snapshot("third", {"input": "three", "previous_response_id": encoded_first})
+    client: Final = _FakePrismaClient([[first], [second], [third]])
+    install_replay_prisma(client)
+    with pytest.raises(ValueError, match="Invalid cycle"):
+        await ResponsesSessionHandler.get_compaction_ancestry("first")
+    assert client.db.calls == [("first",), ("second",), ("third",)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("body", "response", "error"),
+    [
+        ({}, None, "input"),
+        ({"input": ""}, None, "input was not retained"),
+        ({"input": "redacted-by-litellm"}, None, "redacted or truncated"),
+        ({"input": "partially stored litellm_truncated"}, None, "redacted or truncated"),
+        ({"input": "task", "litellm_truncated": True}, None, "redacted or truncated"),
+        ({"input": "task"}, {}, "output was not retained"),
+        (
+            {"input": "task"},
+            {"object": "response", "output": [{"text": "redacted-by-litellm"}]},
+            "redacted or truncated",
+        ),
+    ],
+)
+async def test_compaction_ancestry_fails_on_missing_redacted_or_truncated_history(
+    body: dict[str, object], response: object | None, error: str, install_replay_prisma: Callable[[object], None]
+) -> None:
+    client: Final = _FakePrismaClient([[_saved_response_snapshot("missing", body, response)]])
+    install_replay_prisma(client)
+    with pytest.raises(ValueError, match=error):
+        await ResponsesSessionHandler.get_compaction_ancestry("missing")
+
+
+@pytest.mark.asyncio
+async def test_compaction_ancestry_fails_on_missing_row_or_database(
+    install_replay_prisma: Callable[[object], None],
+) -> None:
+    install_replay_prisma(None)
+    with pytest.raises(ValueError, match="stored response history"):
+        await ResponsesSessionHandler.get_compaction_ancestry("missing")
+    install_replay_prisma(_FakePrismaClient([]))
+    with pytest.raises(ValueError, match="not stored yet"):
+        await ResponsesSessionHandler.get_compaction_ancestry("missing")
 
 
 @pytest.mark.asyncio

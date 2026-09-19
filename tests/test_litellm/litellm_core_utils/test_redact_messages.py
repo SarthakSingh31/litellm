@@ -21,6 +21,7 @@ from litellm.litellm_core_utils.redact_messages import (
     should_redact_message_logging,
 )
 from litellm.responses.main import mock_responses_api_response
+from litellm.types.responses.main import CompactionOutputItem
 
 
 @pytest.fixture(autouse=True)
@@ -668,6 +669,18 @@ class TestPerformRedaction:
 
         assert redacted.output[0].content[0].text == "redacted-by-litellm"
         assert response.output[0].content[0].text == "sensitive output"
+
+    @pytest.mark.parametrize("as_dict", [True, False])
+    def test_redacts_compaction_payload_without_changing_client_artifact(self, as_dict: bool) -> None:
+        artifact: Final = CompactionOutputItem(type="compaction", id="cmp_test", encrypted_content="private summary")
+        response: Final = mock_responses_api_response("sensitive output").model_copy(
+            update={"output": [artifact.model_dump() if as_dict else artifact]}
+        )
+        redacted: Final = perform_redaction({}, response)
+        redacted_item: Final = redacted.output[0]
+        assert (redacted_item["encrypted_content"] if as_dict else redacted_item.encrypted_content) == "redacted-by-litellm"
+        original_item: Final = response.output[0]
+        assert (original_item["encrypted_content"] if as_dict else original_item.encrypted_content) == "private summary"
 
     def test_redacts_vertex_provider_metadata_in_standard_logging_response(self):
         details = {
