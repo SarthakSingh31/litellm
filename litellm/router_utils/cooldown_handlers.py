@@ -14,15 +14,19 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Final
 
 import litellm
+from litellm._internal_context import service_target
 from litellm._logging import verbose_router_logger
 from litellm.caching.dual_cache import DualCache
 from litellm.constants import (
     DEFAULT_COOLDOWN_TIME_SECONDS,
     DEFAULT_FAILURE_THRESHOLD_MINIMUM_REQUESTS,
     DEFAULT_FAILURE_THRESHOLD_PERCENT,
+    INTERNAL_CALL_ORIGIN_METADATA_KEY,
     SINGLE_DEPLOYMENT_TRAFFIC_FAILURE_THRESHOLD,
 )
+from litellm.router_utils.cooldown_cache import ROUTER_COOLDOWNS_TARGET
 from litellm.router_utils.cooldown_callbacks import router_cooldown_event_callback
+from litellm.types.utils import BACKGROUND_RESPONSE_COST_POLL_CALL_ORIGIN
 
 from .router_callbacks.track_deployment_metrics import (
     get_deployment_failures_for_current_minute,
@@ -60,6 +64,15 @@ def mark_advisor_orchestration_failure(exception: BaseException) -> None:
 def is_advisor_orchestration_failure(exception: BaseException | None) -> bool:
     """Whether ``exception`` was tagged by ``mark_advisor_orchestration_failure``."""
     return bool(getattr(exception, _ADVISOR_ORCHESTRATION_FAILURE_ATTR, False))
+
+
+def is_background_response_cost_poll_not_found(exception: Exception, litellm_params: Mapping[str, object]) -> bool:
+    """Whether a background response cost poll failed with a provider 404."""
+    return getattr(exception, "status_code", None) == 404 and any(
+        isinstance(candidate, Mapping)
+        and candidate.get(INTERNAL_CALL_ORIGIN_METADATA_KEY) == BACKGROUND_RESPONSE_COST_POLL_CALL_ORIGIN
+        for candidate in (litellm_params.get("metadata"), litellm_params.get("litellm_metadata"))
+    )
 
 
 _EXCEPTION_POLICY_FIELDS: Final[tuple[tuple[type, str], ...]] = (
@@ -603,12 +616,13 @@ def _increment_allowed_fails(cache: DualCache, cache_key: str, ttl: float) -> in
     Return the fleet-wide fail count. ``DualCache.increment_cache`` bumps the in-memory tier
     before Redis and re-raises a Redis error, so a Redis outage degrades to this worker's own count.
     """
-    try:
-        return cache.increment_cache(key=cache_key, value=1, ttl=ttl)
-    except Exception as e:  # noqa: BLE001  # a Redis outage must not stop failing deployments from cooling down
-        verbose_router_logger.warning("allowed_fails counter fell back to this worker's in-memory count: %s", e)
-        local_fails: Final = cache.get_cache(key=cache_key, local_only=True)
-        return local_fails if isinstance(local_fails, int) else 0
+    with service_target(ROUTER_COOLDOWNS_TARGET):
+        try:
+            return cache.increment_cache(key=cache_key, value=1, ttl=ttl)
+        except Exception as e:  # noqa: BLE001  # a Redis outage must not stop failing deployments from cooling down
+            verbose_router_logger.warning("allowed_fails counter fell back to this worker's in-memory count: %s", e)
+            local_fails: Final = cache.get_cache(key=cache_key, local_only=True)
+            return local_fails if isinstance(local_fails, int) else 0
 
 
 def _is_allowed_fails_set_on_router(

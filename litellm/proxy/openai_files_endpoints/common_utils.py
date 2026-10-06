@@ -1,7 +1,7 @@
 import base64
 import mimetypes
 import re
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import (
@@ -38,6 +38,7 @@ if TYPE_CHECKING:
 FILE_LIST_CONTINUATION_CHUNK_SIZE: Final = 500
 
 BATCH_CREATE_HIDDEN_PARAM: Final = "batch_create"
+LITELLM_EXECUTED_BATCH_ID_PREFIX: Final = "litellm_batch_"
 
 
 def validate_file_list_limit(limit: int | None) -> None:
@@ -92,6 +93,15 @@ class ManagedResourceAccessChecker(Protocol):
         unified_object_id: str,
         user_api_key_dict: "UserAPIKeyAuth",
     ) -> bool: ...
+
+
+@runtime_checkable
+class ManagedFileIdResolver(Protocol):
+    async def get_unified_file_ids_for_provider_file_ids(
+        self,
+        provider_file_ids: Sequence[str],
+        user_api_key_dict: "UserAPIKeyAuth",
+    ) -> Mapping[str, str]: ...
 
 
 def _is_base64_encoded_unified_file_id(b64_uid: str) -> str | Literal[False]:
@@ -177,6 +187,11 @@ def get_batch_id_from_unified_batch_id(file_id: str) -> str:
     else:
         batch_id = file_id.split("generic_response_id:", 1)[1]
     return re.split(r"[;,]", batch_id, maxsplit=1)[0]
+
+
+def is_litellm_executed_batch(decoded_unified_batch_id: str) -> bool:
+    _, marker, batch_id = decoded_unified_batch_id.partition("llm_batch_id:")
+    return bool(marker) and batch_id.startswith(LITELLM_EXECUTED_BATCH_ID_PREFIX)
 
 
 def encode_file_id_with_model(file_id: str, model: str, id_type: Literal["file", "batch"] = "file") -> str:
@@ -1241,7 +1256,7 @@ async def map_raw_file_ids_to_unified(
     if not raw_file_ids or not prisma_client:
         return MappingProxyType({})
     managed_files: Final = await ManagedFileRepository(prisma_client).table.find_many(
-        where={"flat_model_file_ids": {"hasSome": sorted(raw_file_ids)}}  # mutable-ok: prisma where is a plain dict
+        where={"flat_model_file_ids": {"hasSome": sorted(raw_file_ids)}}
     )
     return MappingProxyType(
         {
