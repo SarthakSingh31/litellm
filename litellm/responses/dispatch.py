@@ -87,29 +87,103 @@ _ADISPATCH: Final = PublicDispatch(
 )
 
 
+def _compaction_request(
+    legacy: inspect.Signature, args: tuple[object, ...], kwargs: Mapping[str, object]
+) -> Mapping[str, object] | None:
+    fields: Final = bind(legacy, args, kwargs)
+    if fields is None:
+        return None
+    explicit: Final = MappingProxyType({key: value for key, value in fields.items() if key != "kwargs"})
+    extra: Final = optional_mapping(fields.get("kwargs")) or MappingProxyType({})
+    return MappingProxyType({**explicit, **extra})
+
+
 def responses(
     *args: object,
     **kwargs: object,  # kwargs-ok: preserve the public Responses call shape
 ) -> ResponsesResult | Coroutine[object, object, ResponsesResult]:
+    from litellm.litellm_core_utils.asyncify import run_async_function
+    from litellm.responses.compaction import (
+        COMPACTION_CHILD_KEY,
+        COMPACTION_SESSION_KEY,
+        CompactionSession,
+        finish_compaction,
+        prepare_compaction,
+    )
+
+    session: Final = CompactionSession()
+    managed: Final = (
+        isinstance(kwargs.get(COMPACTION_SESSION_KEY), CompactionSession) or kwargs.get(COMPACTION_CHILD_KEY) is True
+    )
+    request: Final = _compaction_request(_RESPONSES, args, kwargs)
+    prepared: Final = (
+        run_async_function(prepare_compaction, request, session, _execute_summary)
+        if request is not None and not managed and kwargs.get("aresponses") is not True
+        else None
+    )
+    changed: Final = prepared is not None and prepared is not request
+    forwarded: Final = MappingProxyType(
+        {
+            key: value
+            for key, value in (prepared if changed and prepared is not None else kwargs).items()
+            if key not in (COMPACTION_SESSION_KEY, COMPACTION_CHILD_KEY)
+        }
+    )
     python: Final = _PYTHON_RESPONSES
-    return _DISPATCH.run(
-        args,
-        kwargs,
+    result: Final = _DISPATCH.run(
+        () if changed else args,
+        forwarded,
         python=python,
         binding=NATIVE_RESPONSES,
         native=call_hook,
     )
+    if isinstance(result, (ResponsesAPIResponse, BaseResponsesAPIStreamingIterator)) and not managed:
+        return finish_compaction(result, session)
+    return result
+
+
+async def _execute_summary(request: Mapping[str, object]) -> ResponsesResult:
+    from litellm.responses.compaction import COMPACTION_CHILD_KEY
+
+    return await _PYTHON_ARESPONSES(
+        **MappingProxyType({key: value for key, value in request.items() if key != COMPACTION_CHILD_KEY})
+    )
 
 
 async def aresponses(*args: object, **kwargs: object) -> ResponsesResult:  # kwargs-ok: preserve the public call shape
+    from litellm.responses.compaction import (
+        COMPACTION_CHILD_KEY,
+        COMPACTION_SESSION_KEY,
+        CompactionSession,
+        finish_compaction,
+        prepare_compaction,
+    )
+
+    session: Final = CompactionSession()
+    managed: Final = (
+        isinstance(kwargs.get(COMPACTION_SESSION_KEY), CompactionSession) or kwargs.get(COMPACTION_CHILD_KEY) is True
+    )
+    request: Final = _compaction_request(_ARESPONSES, args, kwargs)
+    prepared: Final = (
+        await prepare_compaction(request, session, _execute_summary) if request is not None and not managed else None
+    )
+    changed: Final = prepared is not None and prepared is not request
+    forwarded: Final = MappingProxyType(
+        {
+            key: value
+            for key, value in (prepared if changed and prepared is not None else kwargs).items()
+            if key not in (COMPACTION_SESSION_KEY, COMPACTION_CHILD_KEY)
+        }
+    )
     python: Final = _PYTHON_ARESPONSES
-    return await _ADISPATCH.arun(
-        args,
-        kwargs,
+    result: Final = await _ADISPATCH.arun(
+        () if changed else args,
+        forwarded,
         python=python,
         binding=NATIVE_ARESPONSES,
         native=call_hook,
     )
+    return result if managed else finish_compaction(result, session)
 
 
 responses.__doc__ = _PYTHON_RESPONSES.__doc__
