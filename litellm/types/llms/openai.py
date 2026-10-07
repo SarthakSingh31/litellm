@@ -609,10 +609,16 @@ class ChatCompletionToolCallFunctionChunk(TypedDict, total=False):
     provider_specific_fields: dict[str, Any] | None
 
 
+class ChatCompletionCachedContent(TypedDict):
+    type: Literal["ephemeral"]
+    ttl: NotRequired[Literal["5m", "1h"]]
+
+
 class ChatCompletionAssistantToolCall(TypedDict):
     id: str | None
     type: Literal["function"]
     function: ChatCompletionToolCallFunctionChunk
+    cache_control: NotRequired[ReadOnly[ChatCompletionCachedContent]]
 
 
 class ChatCompletionToolCallChunk(TypedDict):  # result of /chat/completions call
@@ -620,6 +626,7 @@ class ChatCompletionToolCallChunk(TypedDict):  # result of /chat/completions cal
     type: Literal["function"]
     function: ChatCompletionToolCallFunctionChunk
     index: int
+    cache_control: NotRequired[ReadOnly[ChatCompletionCachedContent]]
 
 
 class ChatCompletionDeltaToolCallChunk(TypedDict, total=False):
@@ -627,11 +634,6 @@ class ChatCompletionDeltaToolCallChunk(TypedDict, total=False):
     type: Literal["function"]
     function: ChatCompletionToolCallFunctionChunk
     index: int
-
-
-class ChatCompletionCachedContent(TypedDict):
-    type: Literal["ephemeral"]
-    ttl: NotRequired[Literal["5m", "1h"]]
 
 
 class PromptCacheBreakpoint(TypedDict):
@@ -876,6 +878,7 @@ class ChatCompletionToolMessage(TypedDict):
     role: Literal["tool"]
     content: str | Iterable[ToolMessageContentPart]  # writable-ok: Pydantic warns on ReadOnly TypedDict fields
     tool_call_id: str
+    cache_control: NotRequired[ReadOnly[ChatCompletionCachedContent]]
 
 
 class ChatCompletionFunctionMessage(TypedDict):
@@ -883,6 +886,7 @@ class ChatCompletionFunctionMessage(TypedDict):
     content: str | Iterable[ChatCompletionTextObject] | None
     name: str
     tool_call_id: str | None
+    cache_control: NotRequired[ReadOnly[ChatCompletionCachedContent]]
 
 
 class OpenAIChatCompletionSystemMessage(TypedDict, total=False):

@@ -141,6 +141,7 @@ from litellm.types.litellm_params import ControlOptions, RetryStrategy
 from litellm.types.router import GenericLiteLLMParams
 from litellm.types.utils import (
     CustomPricingLiteLLMParams,
+    DynamicPromptManagementParamLiteral,
     ModelResponseStream,
     RawRequestTypedDict,
     StreamingChoices,
@@ -534,6 +535,7 @@ async def acompletion(
     litellm_logging_obj: Final = kwargs.get("litellm_logging_obj", None)
 
     from litellm.integrations.anthropic_cache_control_hook import (
+        ANTHROPIC_RESPONSES_CACHE_SCOPE,
         AnthropicCacheControlHook,
     )
     from litellm.types.llms.openai import AllMessageValues
@@ -546,6 +548,8 @@ async def acompletion(
         tools=tools,
         enable_prompt_caching=cast(bool | None, kwargs.get("enable_prompt_caching")),  # cast-ok: untyped kwargs
         api_base=kwargs.get("api_base") or base_url,
+        scoped_bridge=kwargs.get(ANTHROPIC_RESPONSES_CACHE_SCOPE) is True,
+        request_kwargs=kwargs,
     )
 
     if isinstance(litellm_logging_obj, LiteLLMLoggingObj) and (
@@ -5410,6 +5414,8 @@ def completion(
     ## PROMPT MANAGEMENT HOOKS ##
 
     from litellm.integrations.anthropic_cache_control_hook import (
+        ANTHROPIC_RESPONSES_CACHE_SCOPE,
+        RESPONSES_CACHE_PROVIDER,
         AnthropicCacheControlHook,
     )
     from litellm.types.llms.openai import AllMessageValues
@@ -5422,6 +5428,8 @@ def completion(
         tools=tools,
         enable_prompt_caching=cast(bool | None, kwargs.get("enable_prompt_caching")),  # cast-ok: untyped kwargs
         api_base=kwargs.get("api_base") or base_url,
+        scoped_bridge=kwargs.get(ANTHROPIC_RESPONSES_CACHE_SCOPE) is True,
+        request_kwargs=kwargs,
     )
 
     if isinstance(litellm_logging_obj, LiteLLMLoggingObj) and (
@@ -5644,11 +5652,21 @@ def completion(
             "allowed_openai_params": allowed_openai_params,
             "base_model": base_model,
         }
-        optional_params = get_optional_params(**optional_param_args, **non_default_params)
+        provider_non_default_params: Final = (
+            {
+                key: value
+                for key, value in non_default_params.items()
+                if key not in (ANTHROPIC_RESPONSES_CACHE_SCOPE, RESPONSES_CACHE_PROVIDER)
+                and (key != DynamicPromptManagementParamLiteral.CACHE_CONTROL_INJECTION_POINTS.value or value)
+            }
+            if kwargs.get(ANTHROPIC_RESPONSES_CACHE_SCOPE) is True
+            else non_default_params
+        )
+        optional_params = get_optional_params(**optional_param_args, **provider_non_default_params)
         processed_non_default_params: Final = pre_process_non_default_params(
             model=model,
             passed_params=optional_param_args,
-            special_params=non_default_params,
+            special_params=provider_non_default_params,
             custom_llm_provider=custom_llm_provider,
             additional_drop_params=kwargs.get("additional_drop_params"),
             remove_sensitive_keys=True,

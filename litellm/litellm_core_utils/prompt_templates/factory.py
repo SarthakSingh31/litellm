@@ -6,13 +6,13 @@ import json
 import mimetypes
 import re
 import xml.etree.ElementTree as ET
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from enum import Enum
 from types import MappingProxyType
 from typing import Any, Final, TypeAlias, TypedDict, cast, overload
 
 from jinja2.sandbox import ImmutableSandboxedEnvironment
-from pydantic import BaseModel
+from pydantic import BaseModel, TypeAdapter
 
 import litellm
 import litellm.types
@@ -1537,6 +1537,90 @@ def _sanitize_anthropic_tool_use_id(tool_use_id: str) -> str:
     return _replace_invalid_tool_use_id_chars(tool_use_id, _ANTHROPIC_TOOL_USE_ID_INVALID_CHARS)
 
 
+def anthropic_tool_use_id_survives(tool_id: str, earlier_ids: Iterable[str]) -> bool:
+    return tool_id not in earlier_ids
+
+
+_CACHE_CALL_MAPPING: Final = TypeAdapter(Mapping[str, object])
+_CACHE_CALL_SEQUENCE: Final = TypeAdapter(tuple[object, ...])
+
+
+def _anthropic_message_field(message: object, key: str) -> object:
+    if isinstance(message, BaseModel):
+        fields: Final = cast(  # cast-ok: Pydantic stores its declared fields in this dictionary
+            Mapping[str, object], message.__dict__
+        )
+        if key in fields:
+            return fields[key]
+        extras: Final = cast(  # cast-ok: Pydantic stores accepted SDK dynamic fields in this mapping
+            Mapping[str, object] | None, message.__pydantic_extra__
+        )
+        return extras.get(key) if extras is not None else None
+    if isinstance(message, Mapping):
+        return _CACHE_CALL_MAPPING.validate_python(message).get(key)
+    return None
+
+
+def anthropic_surviving_tool_call_indices(messages: Sequence[object], target_index: int) -> tuple[int, ...]:
+    message: Final = messages[target_index]
+    if _anthropic_message_field(message, "role") != "assistant":
+        return ()
+    calls: Final = _anthropic_message_field(message, "tool_calls")
+    if not isinstance(calls, list):
+        return ()
+    call_sequence: Final = _CACHE_CALL_SEQUENCE.validate_python(calls)
+    group_start: Final = next(
+        (
+            index + 1
+            for index in range(target_index - 1, -1, -1)
+            if _anthropic_message_field(messages[index], "role") != "assistant"
+        ),
+        0,
+    )
+    previous_ids: Final = tuple(_anthropic_call_ids(messages[index]) for index in range(group_start, target_index))
+    flattened_ids: Final = tuple(itertools.chain.from_iterable(previous_ids))
+    return tuple(
+        _iter_anthropic_surviving_calls(
+            call_sequence, flattened_ids, _anthropic_message_field(message, "provider_specific_fields")
+        )
+    )
+
+
+def _iter_anthropic_surviving_calls(
+    calls: Sequence[object], earlier_ids: Iterable[str], provider_specific_fields: object
+) -> Iterator[int]:
+    seen: Final[set[str]] = set(earlier_ids)  # mutable-ok: one-pass first-wins membership, not request state
+    for index, call in enumerate(calls):
+        emitted = _anthropic_emitted_call(call, provider_specific_fields)
+        if emitted is None:
+            continue
+        emitted_id, rebuilt = emitted
+        if not anthropic_tool_use_id_survives(emitted_id, seen):
+            continue
+        seen.add(emitted_id)
+        if not rebuilt:
+            yield index
+
+
+def _anthropic_emitted_call(call: object, provider_specific_fields: object) -> tuple[str, bool] | None:
+    from litellm.llms.anthropic.common_utils import tool_call_is_rebuilt_as_server_tool_use
+
+    call_id: Final = _anthropic_message_field(call, "id")
+    if _anthropic_message_field(call, "type") != "function" or not isinstance(call_id, str):
+        return None
+    rebuilt: Final = tool_call_is_rebuilt_as_server_tool_use(call_id, provider_specific_fields)
+    return (call_id if rebuilt else _sanitize_anthropic_tool_use_id(call_id), rebuilt)
+
+
+def _anthropic_call_ids(message: object) -> tuple[str, ...]:
+    calls: Final = _anthropic_message_field(message, "tool_calls")
+    if not isinstance(calls, (list, tuple)):
+        return ()
+    call_sequence: Final = _CACHE_CALL_SEQUENCE.validate_python(calls)
+    fields: Final = _anthropic_message_field(message, "provider_specific_fields")
+    return tuple(emitted[0] for call in call_sequence if (emitted := _anthropic_emitted_call(call, fields)) is not None)
+
+
 def _sanitize_bedrock_tool_use_id(tool_use_id: str) -> str:
     """
     Bedrock Converse requires toolUseId to match [a-zA-Z0-9_.:-]+ and be at most 64 chars.
@@ -2782,7 +2866,7 @@ def anthropic_messages_pt(
                     item_id = item.get("id") if isinstance(item, dict) else getattr(item, "id", None)
 
                     if item_id:
-                        if item_id in unique_tool_ids:
+                        if not anthropic_tool_use_id_survives(item_id, unique_tool_ids):
                             continue
                         unique_tool_ids.add(item_id)
 

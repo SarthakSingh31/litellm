@@ -31,7 +31,7 @@ from openai.types.responses.tool_choice_custom_param import ToolChoiceCustomPara
 from openai.types.responses.tool_choice_function_param import ToolChoiceFunctionParam
 from openai.types.responses.tool_param import FunctionToolParam
 from pydantic import TypeAdapter, ValidationError
-from typing_extensions import ReadOnly, TypedDict
+from typing_extensions import NotRequired, ReadOnly, TypedDict
 
 from litellm._logging import verbose_logger
 from litellm.caching import InMemoryCache
@@ -47,6 +47,7 @@ from litellm.types.llms.base import CachedTokensDetails
 from litellm.types.llms.openai import (
     AllMessageValues,
     ChatCompletionAssistantMessage,
+    ChatCompletionCachedContent,
     ChatCompletionImageObject,
     ChatCompletionImageUrlObject,
     ChatCompletionRedactedThinkingBlock,
@@ -194,6 +195,21 @@ _TEXT_ADAPTER: Final = TypeAdapter(str)
 _RESPONSES_API_TOOL_CHOICE_ADAPTER: Final = TypeAdapter(ToolChoice)
 _COMPACTION_BLOCKS_ADAPTER: Final = TypeAdapter(list[dict[str, object]])
 _COMPACTION_CONSUMER_PROVIDERS: Final = frozenset({"anthropic", "bedrock", "vertex_ai"})
+
+
+class _CacheControlAnnotation(TypedDict):
+    cache_control: NotRequired[ReadOnly[ChatCompletionCachedContent]]
+
+
+def _cache_control_annotation(input_item: Mapping[str, object]) -> _CacheControlAnnotation:
+    control: Final = input_item.get("cache_control")
+    if control is None:
+        return _CacheControlAnnotation()
+    return _CacheControlAnnotation(
+        cache_control=cast(  # cast-ok: validates mapping shape; provider validates controls without dropping extension keys
+            ChatCompletionCachedContent, _STR_KEY_DICT_ADAPTER.validate_python(control)
+        )
+    )
 
 
 @runtime_checkable
@@ -997,16 +1013,12 @@ class LiteLLMCompletionResponsesConfig:
             elif pending:
                 # Not followed by an assistant message — keep the reasoning
                 # standalone instead of dropping it.
-                merged.extend(
-                    _standalone(text, blocks, compaction) for text, blocks, compaction in pending
-                )
+                merged.extend(_standalone(text, blocks, compaction) for text, blocks, compaction in pending)
                 pending = []
 
             merged.append(msg)
 
-        merged.extend(
-            _standalone(text, blocks, compaction) for text, blocks, compaction in pending
-        )
+        merged.extend(_standalone(text, blocks, compaction) for text, blocks, compaction in pending)
 
         return merged
 
@@ -1499,9 +1511,7 @@ class LiteLLMCompletionResponsesConfig:
         elif LiteLLMCompletionResponsesConfig._is_input_item_function_call(input_item):
             # handle function call input items
             return LiteLLMCompletionResponsesConfig._transform_responses_api_function_call_to_chat_completion_message(
-                function_call=cast(  # cast-ok: callee coerces every field it reads with `or ""` / str()
-                    Mapping[str, str], input_item
-                )
+                function_call=input_item
             )
         elif input_item.get("type") == "reasoning":
             # A ResponseReasoningItemParam carries the prior-turn chain-of-thought.
@@ -1572,11 +1582,16 @@ class LiteLLMCompletionResponsesConfig:
             # Since guardrails skip None content anyway, we return empty list to exclude it from structured messages
             if content is None:
                 return []
+            ordinary_content: Final = (
+                [ChatCompletionTextObject(type="text", text=content, **_cache_control_annotation(input_item))]
+                if isinstance(content, str) and input_item.get("cache_control") is not None
+                else content
+            )
             return [
                 GenericChatCompletionMessage(
                     role=_input_item_role(input_item),
                     content=LiteLLMCompletionResponsesConfig._transform_responses_api_content_to_chat_completion_content(
-                        content
+                        ordinary_content
                     ),
                 )
             ]
@@ -1800,6 +1815,11 @@ class LiteLLMCompletionResponsesConfig:
             role="tool",
             content=_normalize_function_call_output_to_tool_content(tool_call_output.get("output")),
             tool_call_id=str(call_id),
+            **(
+                _cache_control_annotation(tool_call_output)
+                if tool_call_output.get("type") == "function_call_output"
+                else _CacheControlAnnotation()
+            ),
         )
 
         _tool_use_definition: Final = TOOL_CALLS_CACHE.get_cache(
@@ -1850,7 +1870,7 @@ class LiteLLMCompletionResponsesConfig:
 
     @staticmethod
     def _transform_responses_api_function_call_to_chat_completion_message(
-        function_call: Mapping[str, str],
+        function_call: Mapping[str, object],
     ) -> list[AllMessageValues | GenericChatCompletionMessage | ChatCompletionResponseMessage]:
         """
         Transform a Responses API function_call into a Chat Completion message with tool calls
@@ -1878,17 +1898,22 @@ class LiteLLMCompletionResponsesConfig:
         if not raw_arguments and function_call.get("type") == "custom_tool_call":
             raw_input: Final = function_call.get("input") or ""
             raw_arguments = json.dumps({"content": raw_input}) if raw_input else ""
-        raw_name: Final = function_call.get("name") or ""
-        namespace: Final = function_call.get("namespace") or ""
+        raw_name: Final = str(function_call.get("name") or "")
+        namespace: Final = str(function_call.get("namespace") or "")
         qualify: Final = bool(namespace) and function_call.get("type") != "custom_tool_call"
         tool_call: Final = ChatCompletionToolCallChunk(
-            id=function_call.get("call_id") or function_call.get("id") or "",
+            id=str(function_call.get("call_id") or function_call.get("id") or ""),
             type="function",
             function=ChatCompletionToolCallFunctionChunk(
                 name=f"{namespace}__{raw_name}" if qualify else raw_name,
                 arguments=serialize_tool_call_arguments(raw_arguments),
             ),
             index=0,
+            **(
+                _cache_control_annotation(function_call)
+                if function_call.get("type") == "function_call"
+                else _CacheControlAnnotation()
+            ),
         )
 
         # Create an assistant message with the tool call

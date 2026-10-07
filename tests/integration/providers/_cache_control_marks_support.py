@@ -164,16 +164,19 @@ def messages_body(model: str, marker: str, *, stream: bool) -> dict[str, JsonVal
     }
 
 
-def responses_body(model: str, marker: str) -> dict[str, JsonValue]:
+def responses_body(model: str, marker: str, *, caller_marked: bool = True) -> dict[str, JsonValue]:
     items: Final[list[JsonValue]] = [
-        {"role": "user", "content": [{"type": "input_text", "text": ASK, "cache_control": EPHEMERAL}]},
+        {
+            "role": "user",
+            "content": [{"type": "input_text", "text": ASK, **({"cache_control": EPHEMERAL} if caller_marked else {})}],
+        },
         *(
             {
                 "type": "function_call",
                 "call_id": call_id(city),
                 "name": "lookup_weather",
                 "arguments": json.dumps({"city": city}),
-                "cache_control": EPHEMERAL,
+                **({"cache_control": EPHEMERAL} if caller_marked else {}),
             }
             for city in CITIES
         ),

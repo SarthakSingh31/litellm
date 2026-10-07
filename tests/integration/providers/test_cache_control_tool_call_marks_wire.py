@@ -49,6 +49,7 @@ from openai.types.responses import ResponseInputParam
 from openai.types.responses import ToolParam as ResponsesToolParam
 from pydantic import JsonValue, TypeAdapter
 
+import litellm
 from litellm.utils import get_prompt_cache_min_tokens
 
 _JSON_OBJECT: Final = TypeAdapter(dict[str, JsonValue])
@@ -70,6 +71,515 @@ _OPENAI_REPLY: Final = json.dumps(
     }
 ).encode()
 
+_HOUR: Final[dict[str, JsonValue]] = {"type": "ephemeral", "ttl": "1h"}
+_HOUR_POINTS: Final[list[JsonValue]] = [
+    {"location": "message", "role": "system", "control": _HOUR},
+    {"location": "message", "index": -1, "control": _HOUR},
+]
+_THINKING: Final[dict[str, JsonValue]] = {
+    "type": "thinking",
+    "thinking": "I should check the weather.",
+    "signature": "synthetic-signed-thinking",
+}
+_PIXEL: Final = (
+    "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jr1sAAAAASUVORK5CYII="
+)
+
+
+def _wire_blocks(request: Request) -> tuple[dict[str, JsonValue], ...]:
+    body: Final = _JSON_OBJECT.validate_json(request.body)
+    messages: Final = body.get("messages")
+    assert isinstance(messages, list), body
+    return tuple(block for message in messages for block in object_value(message)["content"] if isinstance(block, dict))
+
+
+def _continuation_history(turns: int, *, multimodal: bool) -> list[JsonValue]:
+    def turn(index: int) -> tuple[JsonValue, JsonValue]:
+        output: Final[JsonValue] = (
+            [{"type": "input_text", "text": f"sunny-{index}"}, {"type": "input_image", "image_url": _PIXEL}]
+            if multimodal
+            else f"sunny-{index}"
+        )
+        return (
+            {"type": "function_call", "call_id": f"call_{index}", "name": "lookup_weather", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": f"call_{index}", "output": output},
+        )
+
+    return [
+        {"role": "user", "content": ASK},
+        {"type": "reasoning", "summary": [], "encrypted_content": json.dumps([_THINKING])},
+        *(item for index in range(turns) for item in turn(index)),
+    ]
+
+
+@pytest.mark.parametrize("multimodal", (False, True), ids=("string-result", "multimodal-result"))
+@pytest.mark.parametrize("stream", (False, True), ids=("json", "stream"))
+def test_actual_sync_responses_moves_one_hour_breakpoint_to_each_newest_outer_result(
+    multimodal: bool, stream: bool
+) -> None:
+    with wire_server(anthropic_peer) as wire:
+        for turns in (1, 2, 3):
+            response: Final = litellm.responses(
+                model=f"anthropic/{ANTHROPIC_MODEL}",
+                api_base=wire.url,
+                api_key=PROVIDER_KEY,
+                instructions=SYSTEM,
+                input=cast(ResponseInputParam, _continuation_history(turns, multimodal=multimodal)),
+                max_output_tokens=64,
+                cache_control_injection_points=_HOUR_POINTS,
+                stream=stream,
+                num_retries=0,
+            )
+            if stream:
+                events: Final = list(response)
+                assert events[-1].type == "response.completed", events
+            else:
+                assert response.status == "completed", response
+            request: Final = _only_responses_request(wire)
+            assert [(mark.label, mark.ttl) for mark in anthropic_marks(request)] == [
+                (SYSTEM_LABEL, "1h"),
+                (f"user:tool_result:call_{turns - 1}", "1h"),
+            ], request.body
+            blocks: Final = _wire_blocks(request)
+            assert [block for block in blocks if block["type"] == "thinking"] == [_THINKING], request.body
+            results: Final = [block for block in blocks if block["type"] == "tool_result"]
+            assert [block["tool_use_id"] for block in results] == [f"call_{index}" for index in range(turns)]
+            assert results[-1]["cache_control"] == _HOUR, request.body
+            assert _JSON_OBJECT.validate_json(request.body)["system"] == [
+                {"type": "text", "text": SYSTEM, "cache_control": _HOUR}
+            ], request.body
+            for block in results:
+                content: Final = block["content"]
+                assert not isinstance(content, list) or all("cache_control" not in part for part in content), (
+                    request.body
+                )
+            newest: Final = results[-1]["content"]
+            if multimodal:
+                assert isinstance(newest, list), request.body
+                assert [object_value(part)["type"] for part in newest] == ["text", "image"], request.body
+                assert object_value(newest[0])["text"] == f"sunny-{turns - 1}", request.body
+                assert object_value(object_value(newest[1])["source"])["data"] == _PIXEL.split(",", 1)[1], request.body
+            else:
+                assert newest == f"sunny-{turns - 1}", request.body
+
+
+@pytest.mark.parametrize("multimodal", (False, True), ids=("string-result", "multimodal-result"))
+async def test_async_responses_moves_one_hour_breakpoint_to_outer_result(multimodal: bool) -> None:
+    with wire_server(anthropic_peer) as wire:
+        response: Final = await litellm.aresponses(
+            model=f"anthropic/{ANTHROPIC_MODEL}",
+            api_base=wire.url,
+            api_key=PROVIDER_KEY,
+            instructions=SYSTEM,
+            input=cast(ResponseInputParam, _continuation_history(3, multimodal=multimodal)),
+            max_output_tokens=64,
+            cache_control_injection_points=_HOUR_POINTS,
+            num_retries=0,
+        )
+        assert response.status == "completed", response
+        request: Final = _only_responses_request(wire)
+        assert [(mark.label, mark.ttl) for mark in anthropic_marks(request)] == [
+            (SYSTEM_LABEL, "1h"),
+            ("user:tool_result:call_2", "1h"),
+        ], request.body
+
+
+@pytest.mark.parametrize("stream", (False, True), ids=("json", "stream"))
+def test_responses_bridge_unmarked_trailing_string_receives_configured_point(gateway: Gateway, stream: bool) -> None:
+    marker: Final = new_marker()
+    with wire_server(anthropic_peer) as wire, gateway.scenario() as scenario:
+        model: Final = _anthropic_deployment(scenario, wire, cache_control_injection_points=_HOUR_POINTS)
+        status, text = _stream(
+            gateway, "/v1/responses", {**responses_body(model, marker, caller_marked=False), "stream": stream}
+        )
+        assert status == 200, text
+        assert [(mark.label, mark.ttl) for mark in anthropic_marks(_only_request(wire))] == [
+            (SYSTEM_LABEL, "1h"),
+            (final_label(marker), "1h"),
+        ]
+
+
+def test_actual_sync_responses_preserves_marked_strings_calls_and_outer_result_at_four_mark_cap() -> None:
+    history: Final[list[JsonValue]] = [
+        {"role": "user", "content": ASK},
+        {"role": "assistant", "content": "before-call", "cache_control": _HOUR},
+        {
+            "type": "function_call",
+            "call_id": "call_marked",
+            "name": "lookup_weather",
+            "arguments": "{}",
+            "cache_control": _HOUR,
+        },
+        {"role": "assistant", "content": "after-call", "cache_control": _HOUR},
+        {"type": "function_call_output", "call_id": "call_marked", "output": "sunny", "cache_control": _HOUR},
+    ]
+    with wire_server(anthropic_peer) as wire:
+        response: Final = litellm.responses(
+            model=f"anthropic/{ANTHROPIC_MODEL}",
+            api_base=wire.url,
+            api_key=PROVIDER_KEY,
+            instructions=SYSTEM,
+            input=cast(ResponseInputParam, history),
+            max_output_tokens=64,
+            cache_control_injection_points=_HOUR_POINTS,
+            num_retries=0,
+        )
+        assert response.status == "completed", response
+        request: Final = _only_responses_request(wire)
+        assert [(mark.label, mark.ttl) for mark in anthropic_marks(request)] == [
+            ("assistant:text:before-call", "1h"),
+            ("assistant:text:after-call", "1h"),
+            ("assistant:tool_use:call_marked", "1h"),
+            ("user:tool_result:call_marked", "1h"),
+        ], request.body
+        assert [block["text"] for block in _wire_blocks(request) if block["type"] == "text"] == [
+            ASK,
+            "before-call",
+            "after-call",
+        ], request.body
+
+
+@pytest.mark.parametrize(
+    ("earlier_ttl", "tail_ttl", "inject"),
+    (
+        pytest.param("5m", "1h", False, id="long-after-short-skipped"),
+        pytest.param("1h", "5m", True, id="short-after-long-allowed"),
+    ),
+)
+def test_actual_sync_responses_preserves_caller_ttl_order_without_default_reseeding(
+    earlier_ttl: str, tail_ttl: str, inject: bool
+) -> None:
+    caller: Final[dict[str, JsonValue]] = {"type": "ephemeral", "ttl": earlier_ttl}
+    point: Final[list[JsonValue]] = [
+        {"location": "message", "index": -1, "control": {"type": "ephemeral", "ttl": tail_ttl}}
+    ]
+    history: Final[list[JsonValue]] = [
+        {"role": "user", "content": ASK, "cache_control": caller},
+        {"role": "assistant", "content": "tail"},
+    ]
+    with wire_server(anthropic_peer) as wire:
+        response: Final = litellm.responses(
+            model=f"anthropic/{ANTHROPIC_MODEL}",
+            api_base=wire.url,
+            api_key=PROVIDER_KEY,
+            instructions=SYSTEM,
+            input=cast(ResponseInputParam, history),
+            max_output_tokens=64,
+            cache_control_injection_points=point,
+            num_retries=0,
+        )
+        assert response.status == "completed", response
+        request: Final = _only_responses_request(wire)
+        assert [(mark.label, mark.ttl) for mark in anthropic_marks(request)] == [
+            (ASK_LABEL, earlier_ttl),
+            *([("assistant:text:tail", tail_ttl)] if inject else []),
+        ], request.body
+
+
+@pytest.mark.parametrize(
+    "points",
+    (
+        pytest.param(None, id="null"),
+        pytest.param([], id="empty"),
+        pytest.param([{"location": "message", "index": 99}], id="out-of-range"),
+    ),
+)
+def test_actual_sync_responses_explicit_zero_additions_never_reseed_defaults(points: JsonValue) -> None:
+    with wire_server(anthropic_peer) as wire:
+        response: Final = litellm.responses(
+            model=f"anthropic/{ANTHROPIC_MODEL}",
+            api_base=wire.url,
+            api_key=PROVIDER_KEY,
+            instructions=SYSTEM,
+            input=[{"role": "user", "content": ASK}],
+            max_output_tokens=64,
+            cache_control_injection_points=points,
+            enable_prompt_caching=True,
+            num_retries=0,
+        )
+        assert response.status == "completed", response
+        request: Final = _only_responses_request(wire)
+        assert anthropic_marks(request) == (), request.body
+
+
+@pytest.mark.parametrize("explicit_ttl", ("1h", "5m"), ids=("conflicting", "matching"))
+def test_actual_sync_responses_automatic_tail_ttl_must_match_explicit_addition(explicit_ttl: str) -> None:
+    points: Final[list[JsonValue]] = [
+        {"location": "message", "index": -1, "control": {"type": "ephemeral", "ttl": explicit_ttl}}
+    ]
+    with wire_server(anthropic_peer) as wire:
+        response: Final = litellm.responses(
+            model=f"anthropic/{ANTHROPIC_MODEL}",
+            api_base=wire.url,
+            api_key=PROVIDER_KEY,
+            instructions=SYSTEM,
+            input=[{"role": "user", "content": ASK}],
+            max_output_tokens=64,
+            cache_control_injection_points=points,
+            cache_control=EPHEMERAL,
+            num_retries=0,
+        )
+        assert response.status == "completed", response
+        request: Final = _only_responses_request(wire)
+        assert [(mark.label, mark.ttl) for mark in anthropic_marks(request)] == (
+            [(ASK_LABEL, "5m"), ("request", None)] if explicit_ttl == "5m" else [("request", None)]
+        ), request.body
+        body: Final = _JSON_OBJECT.validate_json(request.body)
+        assert body["cache_control"] == EPHEMERAL, request.body
+
+
+def test_actual_sync_responses_nonleading_system_reminder_stands_down_all_configured_points() -> None:
+    history: Final[list[JsonValue]] = [
+        {"role": "user", "content": ASK, "cache_control": {"type": "ephemeral", "ttl": "5m"}},
+        {"role": "assistant", "content": "working"},
+        {"role": "system", "content": "Reminder: use the results."},
+        {"role": "user", "content": "tail"},
+    ]
+    with wire_server(anthropic_peer) as wire:
+        response: Final = litellm.responses(
+            model=f"anthropic/{ANTHROPIC_MODEL}",
+            api_base=wire.url,
+            api_key=PROVIDER_KEY,
+            instructions=SYSTEM,
+            input=cast(ResponseInputParam, history),
+            max_output_tokens=64,
+            cache_control_injection_points=_HOUR_POINTS,
+            num_retries=0,
+        )
+        assert response.status == "completed", response
+        request: Final = _only_responses_request(wire)
+        assert [(mark.label, mark.ttl) for mark in anthropic_marks(request)] == [(ASK_LABEL, "5m")], request.body
+        assert b"Reminder: use the results." in request.body, request.body
+
+
+def test_actual_sync_responses_dropped_output_part_mark_does_not_block_outer_result_injection() -> None:
+    history: Final[list[JsonValue]] = [
+        {"role": "user", "content": ASK},
+        {"type": "function_call", "call_id": "call_parts", "name": "lookup_weather", "arguments": "{}"},
+        {
+            "type": "function_call_output",
+            "call_id": "call_parts",
+            "output": [
+                {"type": "input_text", "text": "sunny", "cache_control": {"type": "ephemeral", "ttl": "5m"}},
+                {"type": "input_text", "text": "warm"},
+            ],
+        },
+    ]
+    with wire_server(anthropic_peer) as wire:
+        response: Final = litellm.responses(
+            model=f"anthropic/{ANTHROPIC_MODEL}",
+            api_base=wire.url,
+            api_key=PROVIDER_KEY,
+            instructions=SYSTEM,
+            input=cast(ResponseInputParam, history),
+            max_output_tokens=64,
+            cache_control_injection_points=_HOUR_POINTS,
+            num_retries=0,
+        )
+        assert response.status == "completed", response
+        request: Final = _only_responses_request(wire)
+        assert [(mark.label, mark.ttl) for mark in anthropic_marks(request)] == [
+            (SYSTEM_LABEL, "1h"),
+            ("user:tool_result:call_parts", "1h"),
+        ], request.body
+        result: Final = [block for block in _wire_blocks(request) if block["type"] == "tool_result"]
+        assert result == [
+            {"type": "tool_result", "tool_use_id": "call_parts", "content": "sunnywarm", "cache_control": _HOUR}
+        ], request.body
+
+
+def test_actual_sync_responses_thinking_only_target_never_receives_an_injected_mark() -> None:
+    history: Final[list[JsonValue]] = [
+        {"role": "user", "content": ASK},
+        {"type": "reasoning", "summary": [], "encrypted_content": json.dumps([_THINKING])},
+    ]
+    with wire_server(anthropic_peer) as wire:
+        response: Final = litellm.responses(
+            model=f"anthropic/{ANTHROPIC_MODEL}",
+            api_base=wire.url,
+            api_key=PROVIDER_KEY,
+            instructions=SYSTEM,
+            input=cast(ResponseInputParam, history),
+            max_output_tokens=64,
+            cache_control_injection_points=[{"location": "message", "index": -1, "control": _HOUR}],
+            num_retries=0,
+        )
+        assert response.status == "completed", response
+        request: Final = _only_responses_request(wire)
+        assert anthropic_marks(request) == (), request.body
+        assert [block for block in _wire_blocks(request) if block["type"] == "thinking"] == [_THINKING], request.body
+
+
+def test_actual_sync_responses_surviving_marked_compaction_stands_down_all_configured_additions() -> None:
+    compaction: Final[dict[str, JsonValue]] = {
+        "type": "compaction",
+        "content": "Earlier weather results are available.",
+        "cache_control": {"type": "ephemeral", "ttl": "5m"},
+        "opaque_annotation": "preserve-this",
+    }
+    history: Final[list[JsonValue]] = [
+        {"role": "user", "content": ASK},
+        {"type": "compaction", "encrypted_content": json.dumps([compaction])},
+        {"type": "function_call", "call_id": "call_compacted", "name": "lookup_weather", "arguments": "{}"},
+        {"type": "function_call_output", "call_id": "call_compacted", "output": "sunny"},
+    ]
+    with wire_server(anthropic_peer) as wire:
+        response: Final = litellm.responses(
+            model=f"anthropic/{ANTHROPIC_MODEL}",
+            api_base=wire.url,
+            api_key=PROVIDER_KEY,
+            instructions=SYSTEM,
+            input=cast(ResponseInputParam, history),
+            max_output_tokens=64,
+            cache_control_injection_points=_HOUR_POINTS,
+            num_retries=0,
+        )
+        assert response.status == "completed", response
+        request: Final = _only_responses_request(wire)
+        assert [(mark.label, mark.ttl) for mark in anthropic_marks(request)] == [("assistant:compaction:", "5m")], (
+            request.body
+        )
+        assert [block for block in _wire_blocks(request) if block["type"] == "compaction"] == [compaction], request.body
+
+
+def test_actual_sync_responses_whitespace_assistant_caller_mark_reserves_its_wire_slot() -> None:
+    history: Final[list[JsonValue]] = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": f"caller-{index}", "cache_control": _HOUR} for index in range(3)
+            ],
+        },
+        {"role": "assistant", "content": [{"type": "output_text", "text": "  ", "cache_control": _HOUR}]},
+        {"role": "user", "content": "unmarked-tail"},
+    ]
+    with wire_server(anthropic_peer) as wire:
+        response: Final = litellm.responses(
+            model=f"anthropic/{ANTHROPIC_MODEL}",
+            api_base=wire.url,
+            api_key=PROVIDER_KEY,
+            instructions=SYSTEM,
+            input=cast(ResponseInputParam, history),
+            max_output_tokens=64,
+            cache_control_injection_points=_HOUR_POINTS,
+            num_retries=0,
+        )
+        assert response.status == "completed", response
+        request: Final = _only_responses_request(wire)
+        marks: Final = anthropic_marks(request)
+        assert len(marks) == 4, request.body
+        assert [(mark.label, mark.ttl) for mark in marks[:3]] == [
+            (f"user:text:caller-{index}", "1h") for index in range(3)
+        ], request.body
+        assert marks[-1].label.startswith("assistant:text:") and marks[-1].ttl == "1h", request.body
+        assert [block["cache_control"] for block in _wire_blocks(request) if "cache_control" in block] == [_HOUR] * 4, (
+            request.body
+        )
+        assert [block for block in _wire_blocks(request) if block.get("text") == "unmarked-tail"] == [
+            {"type": "text", "text": "unmarked-tail"}
+        ], request.body
+        assert _JSON_OBJECT.validate_json(request.body)["system"] == [{"type": "text", "text": SYSTEM}], request.body
+
+
+def test_direct_chat_sdk_message_retains_its_configured_recipient_mark_on_the_wire() -> None:
+    with wire_server(anthropic_peer) as wire:
+        response: Final = litellm.completion(
+            model=f"anthropic/{ANTHROPIC_MODEL}",
+            api_base=wire.url,
+            api_key=PROVIDER_KEY,
+            messages=[litellm.Message(role="user", content=ASK)],
+            max_tokens=64,
+            cache_control_injection_points=[{"location": "message", "index": 0, "control": _HOUR}],
+            num_retries=0,
+        )
+        assert response.choices[0].message.content == "sunny", response
+        request: Final = _only_request(wire)
+        assert _JSON_OBJECT.validate_json(request.body)["messages"] == [
+            {"role": "user", "content": [{"type": "text", "text": ASK, "cache_control": _HOUR}]}
+        ], request.body
+        assert [(mark.label, mark.ttl) for mark in anthropic_marks(request)] == [(ASK_LABEL, "1h")], request.body
+
+
+@pytest.mark.parametrize("second_id", ("call_duplicate", "call.duplicate"), ids=("duplicate", "sanitized-collision"))
+@pytest.mark.parametrize("later_marked", (False, True), ids=("configured-last-survivor", "dropped-caller-mark"))
+def test_actual_sync_responses_duplicate_call_marks_do_not_move_from_later_duplicate(
+    second_id: str, later_marked: bool
+) -> None:
+    history: Final[list[JsonValue]] = [
+        {"role": "user", "content": ASK},
+        {
+            "type": "function_call",
+            "call_id": "call_duplicate",
+            "name": "lookup_weather",
+            "arguments": '{"city":"first"}',
+        },
+        {
+            "type": "function_call",
+            "call_id": second_id,
+            "name": "lookup_weather",
+            "arguments": '{"city":"second"}',
+            **({"cache_control": _HOUR} if later_marked else {}),
+        },
+    ]
+    points: Final[list[JsonValue]] = (
+        [] if later_marked else [{"location": "message", "role": "assistant", "control": _HOUR}]
+    )
+    with wire_server(anthropic_peer) as wire:
+        response: Final = litellm.responses(
+            model=f"anthropic/{ANTHROPIC_MODEL}",
+            api_base=wire.url,
+            api_key=PROVIDER_KEY,
+            input=cast(ResponseInputParam, history),
+            max_output_tokens=64,
+            cache_control_injection_points=points,
+            num_retries=0,
+        )
+        assert response.status == "completed", response
+        request: Final = _only_responses_request(wire)
+        calls: Final = [block for block in _wire_blocks(request) if block["type"] == "tool_use"]
+        assert calls == [
+            {
+                "type": "tool_use",
+                "id": "call_duplicate",
+                "name": "lookup_weather",
+                "input": {"city": "first"},
+                **({} if later_marked else {"cache_control": _HOUR}),
+            }
+        ], request.body
+        assert anthropic_labels(request) == ([] if later_marked else ["assistant:tool_use:call_duplicate"]), (
+            request.body
+        )
+
+
+@pytest.mark.parametrize("result_tail", (False, True), ids=("native-tool-use", "native-tool-result"))
+def test_messages_native_tool_only_tail_remains_an_eligible_outer_recipient(
+    gateway: Gateway, result_tail: bool
+) -> None:
+    messages: Final[list[JsonValue]] = [
+        {"role": "user", "content": ASK},
+        {
+            "role": "assistant",
+            "content": [{"type": "tool_use", "id": "call_native", "name": "lookup_weather", "input": {}}],
+        },
+        *(
+            [{"role": "user", "content": [{"type": "tool_result", "tool_use_id": "call_native", "content": "sunny"}]}]
+            if result_tail
+            else []
+        ),
+    ]
+    with wire_server(anthropic_peer) as wire, gateway.scenario() as scenario:
+        model: Final = _anthropic_deployment(
+            scenario, wire, cache_control_injection_points=[{"location": "message", "index": -1, "control": _HOUR}]
+        )
+        response: Final = gateway.request(
+            "POST", "/v1/messages", {"model": model, "max_tokens": 64, "messages": messages}
+        )
+        assert response.status_code == 200, response.text
+        request: Final = _only_request(wire)
+        assert [(mark.label, mark.ttl) for mark in anthropic_marks(request)] == [
+            (("user:tool_result:call_native" if result_tail else "assistant:tool_use:call_native"), "1h")
+        ], request.body
+
 
 def _anthropic_deployment(scenario: Scenario, wire: Wire, **fields: JsonValue) -> str:
     return scenario.model(model=f"anthropic/{ANTHROPIC_MODEL}", api_base=wire.url, api_key=PROVIDER_KEY, **fields)
@@ -78,7 +588,15 @@ def _anthropic_deployment(scenario: Scenario, wire: Wire, **fields: JsonValue) -
 def _only_request(wire: Wire) -> Request:
     received: Final = wire.drain()
     assert len(received) == 1, [request.target for request in received]
-    return received[0]
+    request: Final = received[0]
+    assert "_litellm_anthropic_responses_cache_scope" not in _JSON_OBJECT.validate_json(request.body), request.body
+    return request
+
+
+def _only_responses_request(wire: Wire) -> Request:
+    request: Final = _only_request(wire)
+    assert "cache_control_injection_points" not in _JSON_OBJECT.validate_json(request.body), request.body
+    return request
 
 
 def _stream(gateway: Gateway, path: str, body: dict[str, JsonValue], *, key: str | None = None) -> tuple[int, str]:
@@ -475,14 +993,14 @@ def test_messages_endpoint_points_skip_injection_when_tool_use_marks_fill_the_ca
         assert anthropic_labels(_only_request(wire)) == _CLIENT_MARKED
 
 
-def test_responses_bridge_keeps_system_and_user_marks_within_the_cap(gateway: Gateway) -> None:
+def test_responses_bridge_preserves_four_caller_marks_without_configured_additions(gateway: Gateway) -> None:
     marker: Final = new_marker()
     with wire_server(anthropic_peer) as wire, gateway.scenario() as scenario:
         model: Final = _anthropic_deployment(scenario, wire, cache_control_injection_points=POINTS)
         response: Final = gateway.request("POST", "/v1/responses", responses_body(model, marker))
         assert response.status_code == 200, response.text
         assert _JSON_OBJECT.validate_json(response.content)["status"] == "completed", response.text
-        assert anthropic_labels(_only_request(wire)) == [SYSTEM_LABEL, ASK_LABEL]
+        assert anthropic_labels(_only_request(wire)) == _CLIENT_MARKED
 
 
 def test_response_cache_serves_the_capped_request_once(gateway: Gateway) -> None:
@@ -536,14 +1054,14 @@ def test_assistant_without_tool_calls_keeps_configured_points(gateway: Gateway, 
     assert labels == [SYSTEM_LABEL, ASK_LABEL, final_label(marker)]
 
 
-def test_responses_stream_bridge_keeps_system_and_user_marks_within_the_cap(gateway: Gateway) -> None:
+def test_responses_stream_bridge_preserves_four_caller_marks_without_configured_additions(gateway: Gateway) -> None:
     marker: Final = new_marker()
     with wire_server(anthropic_peer) as wire, gateway.scenario() as scenario:
         model: Final = _anthropic_deployment(scenario, wire, cache_control_injection_points=POINTS)
         status, text = _stream(gateway, "/v1/responses", {**responses_body(model, marker), "stream": True})
         assert status == 200, text
         assert '"type":"response.completed"' in text, text
-        assert anthropic_labels(_only_request(wire)) == [SYSTEM_LABEL, ASK_LABEL]
+        assert anthropic_labels(_only_request(wire)) == _CLIENT_MARKED
 
 
 def _openai_client(gateway: Gateway) -> openai.OpenAI:
@@ -667,7 +1185,7 @@ async def test_anthropic_sdk_async_messages_stream_keeps_the_capped_request_with
     assert gateway_injected(f"msg_{marker}") is False
 
 
-async def test_openai_sdk_async_responses_keeps_system_and_user_marks_within_the_cap(gateway: Gateway) -> None:
+async def test_openai_sdk_async_responses_preserves_four_caller_marks_without_additions(gateway: Gateway) -> None:
     marker: Final = new_marker()
     with wire_server(anthropic_peer) as wire, gateway.scenario() as scenario:
         model: Final = _anthropic_deployment(scenario, wire, cache_control_injection_points=POINTS)
@@ -681,7 +1199,7 @@ async def test_openai_sdk_async_responses_keeps_system_and_user_marks_within_the
                 input=cast(ResponseInputParam, body["input"]),
             )
         assert response.status == "completed", response.model_dump()
-        assert anthropic_labels(_only_request(wire)) == [SYSTEM_LABEL, ASK_LABEL]
+        assert anthropic_labels(_only_request(wire)) == _CLIENT_MARKED
 
 
 def test_request_level_points_skip_injection_when_client_marks_fill_the_cap(gateway: Gateway) -> None:
@@ -856,7 +1374,7 @@ def test_response_cache_twins_on_messages_and_responses_stay_within_the_cap(gate
         responses: Final = tuple(gateway.request("POST", path, body) for _ in range(2))
         received: Final = wire.drain()
     assert [response.status_code for response in responses] == [200, 200], [response.text for response in responses]
-    expected: Final = _CLIENT_MARKED if path == "/v1/messages" else [SYSTEM_LABEL, ASK_LABEL]
+    expected: Final = _CLIENT_MARKED
     assert [anthropic_labels(request) for request in received] == [expected] * len(received)
     assert len(received) == 1, [request.target for request in received]
 

@@ -18,7 +18,11 @@ from litellm.completion_extras.litellm_responses_transformation.transformation i
     LiteLLMResponsesTransformationHandler,
 )
 from litellm.constants import DEFAULT_CHAT_COMPLETION_PARAM_VALUES, request_timeout
-from litellm.integrations.anthropic_cache_control_hook import CARRY_UNMATCHED_MESSAGE_POINTS
+from litellm.integrations.anthropic_cache_control_hook import (
+    ANTHROPIC_RESPONSES_CACHE_SCOPE,
+    CARRY_UNMATCHED_MESSAGE_POINTS,
+    RESPONSES_CACHE_PROVIDER,
+)
 from litellm.litellm_core_utils.asyncify import run_async_function
 from litellm.litellm_core_utils.core_helpers import normalize_drop_params
 from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
@@ -452,6 +456,7 @@ def _bridge_kwargs(
             *DEFAULT_CHAT_COMPLETION_PARAM_VALUES,
             *all_litellm_params,
             *GenericLiteLLMParams.model_fields,
+            ANTHROPIC_RESPONSES_CACHE_SCOPE,
             *(allowed_openai_params or ()),
         )
     ).difference(_RESPONSES_ONLY_REQUEST_FIELDS_NEVER_BRIDGED)
@@ -508,6 +513,7 @@ def _deployment_model_info_after_prompt_swap(
 class _AsyncPromptManagementOutcome:
     merged_optional_params: Mapping[str, object]
     deployment_model_info: object
+    scoped_cache: bool = False
 
 
 def _resolve_responses_api_provider_config(
@@ -554,6 +560,7 @@ def _will_bridge_to_chat_completions(
 def _prompt_management_sees_a_provisional_message_list(
     kwargs: dict[str, object],  # mutable-ok: the signal is read and popped out of the caller's own kwargs
     bridged: bool,
+    resolved_provider: str | None = None,
 ) -> Generator[None, None]:
     """Tell the cache-control hook that this layer's messages are not the ones sent upstream.
 
@@ -569,10 +576,12 @@ def _prompt_management_sees_a_provisional_message_list(
         yield
         return
     kwargs[CARRY_UNMATCHED_MESSAGE_POINTS] = True
+    kwargs[RESPONSES_CACHE_PROVIDER] = resolved_provider
     try:
         yield
     finally:
         kwargs.pop(CARRY_UNMATCHED_MESSAGE_POINTS, None)
+        kwargs.pop(RESPONSES_CACHE_PROVIDER, None)
 
 
 @client
@@ -616,6 +625,9 @@ async def aresponses(
     local_vars: Final = locals()
     try:
         loop: Final = asyncio.get_event_loop()
+        kwargs.pop(ANTHROPIC_RESPONSES_CACHE_SCOPE, None)
+        kwargs.pop(CARRY_UNMATCHED_MESSAGE_POINTS, None)
+        kwargs.pop(RESPONSES_CACHE_PROVIDER, None)
         kwargs["aresponses"] = True
 
         # Convert text_format to text parameter if provided
@@ -651,6 +663,7 @@ async def aresponses(
             client_input: Final = ResponsesAPIRequestUtils.responses_input_to_chat_messages(input)
             with _prompt_management_sees_a_provisional_message_list(
                 kwargs,
+                resolved_provider=custom_llm_provider,
                 bridged=_will_bridge_to_chat_completions(
                     model,
                     custom_llm_provider,
@@ -683,6 +696,7 @@ async def aresponses(
             )
             requested_provider: Final = custom_llm_provider
             if model != original_model:
+                kwargs.pop(ANTHROPIC_RESPONSES_CACHE_SCOPE, None)
                 custom_llm_provider = _resolve_prompt_swapped_provider(
                     original_model=original_model,
                     swapped_model=model,
@@ -696,7 +710,21 @@ async def aresponses(
                 deployment_model_info=_deployment_model_info_after_prompt_swap(
                     requested_provider, custom_llm_provider, kwargs.get("model_info")
                 ),
+                scoped_cache=kwargs.get(ANTHROPIC_RESPONSES_CACHE_SCOPE) is True,
             )
+        else:
+            with _prompt_management_sees_a_provisional_message_list(
+                kwargs,
+                resolved_provider=custom_llm_provider,
+                bridged=_will_bridge_to_chat_completions(
+                    model,
+                    custom_llm_provider,
+                    bool(kwargs.get("use_chat_completions_api")),
+                    kwargs.get("model_info"),
+                    _api_base_kwarg(kwargs),
+                ),
+            ):
+                LiteLLMLoggingObj.mark_provisional_responses_cache_scope(kwargs, None)
 
         func: Final = partial(
             responses,
@@ -805,9 +833,14 @@ def _apply_prompt_management_to_responses_call(
     """Returns the prompt-managed input, model and provider, plus the deployment metadata that still
     describes the upstream (``None`` once the prompt manager moved the request to another provider)."""
     async_outcome: Final[_AsyncPromptManagementOutcome | None] = kwargs.pop("_async_prompt_merged_params", None)
+    kwargs.pop(ANTHROPIC_RESPONSES_CACHE_SCOPE, None)
+    kwargs.pop(CARRY_UNMATCHED_MESSAGE_POINTS, None)
+    kwargs.pop(RESPONSES_CACHE_PROVIDER, None)
     if async_outcome is not None:
         for key, value in async_outcome.merged_optional_params.items():
             local_vars[key] = value
+        if async_outcome.scoped_cache:
+            kwargs[ANTHROPIC_RESPONSES_CACHE_SCOPE] = True
         return input, model, custom_llm_provider, async_outcome.deployment_model_info
 
     prompt_id: Final = cast(str | None, kwargs.get("prompt_id", None))
@@ -821,6 +854,7 @@ def _apply_prompt_management_to_responses_call(
     ):
         with _prompt_management_sees_a_provisional_message_list(
             kwargs,
+            resolved_provider=custom_llm_provider,
             bridged=_will_bridge_to_chat_completions(
                 model,
                 custom_llm_provider,
@@ -864,6 +898,8 @@ def _apply_prompt_management_to_responses_call(
                 prompt_id=prompt_id,
             )
         )
+        if model != original_model:
+            kwargs.pop(ANTHROPIC_RESPONSES_CACHE_SCOPE, None)
         local_vars["custom_llm_provider"] = resolved_provider
         for key, value in merged_optional_params.items():
             local_vars[key] = value
@@ -874,6 +910,18 @@ def _apply_prompt_management_to_responses_call(
             _deployment_model_info_after_prompt_swap(custom_llm_provider, resolved_provider, kwargs.get("model_info")),
         )
 
+    with _prompt_management_sees_a_provisional_message_list(
+        kwargs,
+        resolved_provider=custom_llm_provider,
+        bridged=_will_bridge_to_chat_completions(
+            model,
+            custom_llm_provider,
+            use_chat_completions_api,
+            kwargs.get("model_info"),
+            _api_base_kwarg(kwargs),
+        ),
+    ):
+        LiteLLMLoggingObj.mark_provisional_responses_cache_scope(kwargs, None)
     return input, model, custom_llm_provider, kwargs.get("model_info")
 
 

@@ -57,7 +57,12 @@ from litellm.exceptions import (
     validate_rate_limit_type,
 )
 from litellm.integrations.agentops import AgentOps
-from litellm.integrations.anthropic_cache_control_hook import AnthropicCacheControlHook
+from litellm.integrations.anthropic_cache_control_hook import (
+    ANTHROPIC_RESPONSES_CACHE_SCOPE,
+    CARRY_UNMATCHED_MESSAGE_POINTS,
+    RESPONSES_CACHE_PROVIDER,
+    AnthropicCacheControlHook,
+)
 from litellm.integrations.arize.arize import ArizeLogger
 from litellm.integrations.custom_guardrail import CustomGuardrail
 from litellm.integrations.custom_logger import CustomLogger
@@ -154,6 +159,7 @@ from litellm.types.utils import (
     LiteLLMBatch,
     LiteLLMLoggingBaseClass,
     LiteLLMRealtimeStreamLoggingObject,
+    LlmProviders,
     ModelInfo,
     ModelResponse,
     ModelResponseStream,
@@ -1062,6 +1068,23 @@ class Logging(LiteLLMLoggingBaseClass):
                 return True
         return False
 
+    @staticmethod
+    def mark_provisional_responses_cache_scope(
+        non_default_params: dict[str, object],
+        prompt_manager: CustomLogger | None,
+        request_kwargs: dict[str, object] | None = None,
+    ) -> None:
+        if (
+            non_default_params.get(CARRY_UNMATCHED_MESSAGE_POINTS) is not True
+            or DynamicPromptManagementParamLiteral.CACHE_CONTROL_INJECTION_POINTS.value not in non_default_params
+            or (prompt_manager is not None and not isinstance(prompt_manager, AnthropicCacheControlHook))
+            or non_default_params.get(RESPONSES_CACHE_PROVIDER) != LlmProviders.ANTHROPIC.value
+        ):
+            return
+        non_default_params[ANTHROPIC_RESPONSES_CACHE_SCOPE] = True
+        if request_kwargs is not None:
+            request_kwargs[ANTHROPIC_RESPONSES_CACHE_SCOPE] = True
+
     def get_chat_completion_prompt(
         self,
         model: str,
@@ -1086,6 +1109,7 @@ class Logging(LiteLLMLoggingBaseClass):
             dynamic_callback_params=self.standard_callback_dynamic_params,
         )
 
+        self.mark_provisional_responses_cache_scope(non_default_params, custom_logger, request_kwargs)
         if custom_logger:
             breakpoints_before: Final = AnthropicCacheControlHook.count_request_cache_breakpoints(messages)
             (
@@ -1138,6 +1162,7 @@ class Logging(LiteLLMLoggingBaseClass):
             dynamic_callback_params=self.standard_callback_dynamic_params,
         )
 
+        self.mark_provisional_responses_cache_scope(non_default_params, custom_logger, request_kwargs)
         if custom_logger:
             breakpoints_before: Final = AnthropicCacheControlHook.count_request_cache_breakpoints(messages)
             (

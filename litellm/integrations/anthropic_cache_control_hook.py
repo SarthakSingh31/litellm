@@ -10,9 +10,11 @@ Supported for both `v1/chat/completions` (via the prompt-management hook) and
 """
 
 import copy
+import itertools
 import os
 import re
 from collections.abc import Iterable, Mapping, Sequence
+from functools import reduce
 from typing import TYPE_CHECKING, Any, Final, cast
 from urllib.parse import urlparse
 
@@ -23,7 +25,12 @@ from litellm.integrations.custom_logger import CustomLogger
 from litellm.integrations.custom_prompt_management import CustomPromptManagement
 from litellm.integrations.prompt_management_base import PromptManagementClient
 from litellm.litellm_core_utils.prompt_templates.common_utils import (
+    is_unsignable_thinking_block,
     with_prompt_cache_breakpoint,
+)
+from litellm.litellm_core_utils.prompt_templates.factory import (
+    anthropic_surviving_tool_call_indices,
+    find_anthropic_server_tool_result,
 )
 from litellm.llms.anthropic.common_utils import (
     is_claude_code_one_shot_subagent_request,
@@ -50,7 +57,7 @@ from litellm.types.llms.openai import (
     PromptCacheOptions,
 )
 from litellm.types.prompts.init_prompts import PromptSpec
-from litellm.types.utils import StandardCallbackDynamicParams
+from litellm.types.utils import ChatCompletionMessageToolCall, Message, StandardCallbackDynamicParams
 
 if TYPE_CHECKING:
     from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
@@ -72,6 +79,8 @@ OPENAI_API_HOST: Final = "api.openai.com"
 OPENAI_API_BASE_ENV_VARS: Final = ("OPENAI_BASE_URL", "OPENAI_API_BASE")
 _OBJECT_MAPPING_ADAPTER: Final = TypeAdapter(dict[object, object])
 _OBJECT_LIST_ADAPTER: Final = TypeAdapter(list[object])
+_OBJECT_SEQUENCE_ADAPTER: Final = TypeAdapter(tuple[object, ...])
+_POINTS_MAPPING_ADAPTER: Final = TypeAdapter(tuple[Mapping[str, object], ...])
 
 AllToolParamValues = ChatCompletionToolParam | AllAnthropicToolsValues
 
@@ -88,6 +97,31 @@ def _validated_object_list(value: object) -> list[object] | None:
         return _OBJECT_LIST_ADAPTER.validate_python(value)
     except ValidationError:
         return None
+
+
+def _optional_string(value: object) -> str | None:
+    return value if isinstance(value, str) else None
+
+
+def _provider_cache_params(params: Mapping[str, object]) -> Mapping[str, object]:
+    return {
+        key: value
+        for key, value in params.items()
+        if key not in (ANTHROPIC_RESPONSES_CACHE_SCOPE, RESPONSES_CACHE_PROVIDER)
+        and (key != "cache_control_injection_points" or bool(value))
+    }
+
+
+def _annotate_cache_control(recipient: object, control: ChatCompletionCachedContent) -> None:
+    if isinstance(recipient, (Message, ChatCompletionMessageToolCall)):
+        setattr(recipient, "cache_control", control)
+        return
+    if not isinstance(recipient, dict):
+        return
+    writable: Final = cast(  # cast-ok: runtime dictionary; the helper's legacy API annotates in place
+        dict[object, object], recipient
+    )
+    writable["cache_control"] = control
 
 
 def supports_openai_prompt_cache_breakpoint(model: str) -> bool:
@@ -170,6 +204,221 @@ def _accepts_prompt_cache_breakpoint(block: object) -> bool:
 CARRY_UNMATCHED_MESSAGE_POINTS: Final = "_litellm_carry_unmatched_cache_control_points"
 
 EXTERNAL_BREAKPOINTS_STAMP: Final = "_litellm_external_breakpoints"
+ANTHROPIC_RESPONSES_CACHE_SCOPE: Final = "_litellm_anthropic_responses_cache_scope"
+RESPONSES_CACHE_PROVIDER: Final = "_litellm_responses_cache_provider"
+_PREFIX_CONTROLS_STAMP: Final = "_litellm_cache_prefix_controls"
+_AUTOMATIC_CONTROL_STAMP: Final = "_litellm_cache_automatic_control"
+_COVERAGE_STAMP: Final = "_litellm_cache_coverage_skip"
+
+
+def _anthropic_cacheable_block(block: object, role: object, native_messages: bool = False) -> bool:
+    mapping: Final = _validated_object_mapping(block)
+    if mapping is None:
+        return False
+    block_type: Final = mapping.get("type")
+    if block_type == "text":
+        text: Final = mapping.get("text")
+        return isinstance(text, str) and bool(text.strip())
+    if block_type in ("tool_use", "tool_result"):
+        return native_messages
+    if role in ("assistant", "system"):
+        return False
+    if block_type == "image":
+        return native_messages
+    if block_type in ("image_url", "document"):
+        return True
+    if block_type == "file":
+        file: Final = _validated_object_mapping(mapping.get("file")) or {}
+        file_id: Final = file.get("file_id")
+        file_format: Final = file.get("format")
+        return bool(file.get("file_data")) or (
+            isinstance(file_id, str)
+            and (
+                file_id.startswith("http")
+                or file_format
+                in (
+                    "application/pdf",
+                    "text/plain",
+                    "document",
+                    "document_url",
+                    "image/jpeg",
+                    "image/png",
+                    "image/gif",
+                    "image/webp",
+                )
+            )
+        )
+    return False
+
+
+def _message_cache_recipients(
+    messages: Sequence[object], index: int, native_messages: bool = False
+) -> tuple[tuple[str, int], ...]:
+    message: Final = messages[index]
+    content: Final = _attribute_or_key(message, "content")
+    role: Final = _attribute_or_key(message, "role")
+    if role in ("tool", "function"):
+        return (("message", 0),) if isinstance(content, (str, list)) else ()
+    ordinary: Final = (
+        (("message", 0),)
+        if isinstance(content, str) and content.strip()
+        else tuple(
+            ("content", i)
+            for i, block in enumerate(_OBJECT_SEQUENCE_ADAPTER.validate_python(content))
+            if _anthropic_cacheable_block(block, role, native_messages)
+        )
+        if isinstance(content, list)
+        else ()
+    )
+    calls: Final = tuple(("call", i) for i in anthropic_surviving_tool_call_indices(messages, index))
+    return (*ordinary, *calls)
+
+
+def _recipient_control(message: object, recipient: tuple[str, int]) -> object:
+    kind, index = recipient
+    if kind == "message":
+        return _attribute_or_key(message, "cache_control")
+    values: Final = _as_object_list(_attribute_or_key(message, "tool_calls" if kind == "call" else "content")) or []
+    return _attribute_or_key(values[index], "cache_control")
+
+
+def _message_controls(messages: Sequence[object], index: int, native_messages: bool = False) -> tuple[object, ...]:
+    return tuple(
+        control
+        for recipient in _message_cache_recipients(messages, index, native_messages)
+        if (control := _recipient_control(messages[index], recipient)) is not None
+    )
+
+
+def _ordered_message_controls(messages: Sequence[object]) -> tuple[object, ...]:
+    return tuple(itertools.chain.from_iterable(_message_controls(messages, index) for index in range(len(messages))))
+
+
+def _contains_cache_control(value: object) -> bool:
+    mapping: Final = _validated_object_mapping(value)
+    if mapping is not None:
+        return mapping.get("cache_control") is not None or any(
+            _contains_cache_control(child) for child in mapping.values()
+        )
+    return isinstance(value, (list, tuple)) and any(
+        _contains_cache_control(child) for child in _OBJECT_SEQUENCE_ADAPTER.validate_python(value)
+    )
+
+
+def _message_coverage_skip(message: object, automatic: bool = False) -> bool:
+    mapping: Final = _validated_object_mapping(message) or {}
+    role: Final = mapping.get("role")
+    content: Final = mapping.get("content")
+    fields: Final = _validated_object_mapping(mapping.get("provider_specific_fields")) or {}
+    if role == "assistant" and (
+        _contains_cache_control(fields.get("compaction_blocks"))
+        or automatic
+        and (bool(fields.get("compaction_blocks")) or mapping.get("function_call") is not None)
+    ):
+        return True
+    calls: Final = _validated_object_list(mapping.get("tool_calls")) or []
+    if role == "assistant" and any(_server_call_coverage_skip(call, fields, automatic) for call in calls):
+        return True
+    thinking: Final = _validated_object_list(mapping.get("thinking_blocks")) or []
+    if any(_contains_cache_control(block) for block in thinking if not is_unsignable_thinking_block(block)):
+        return True
+    blocks: Final = _validated_object_list(content) or []
+    if role in ("user", "assistant", "system") and (
+        isinstance(content, str)
+        and not content.strip()
+        and mapping.get("cache_control") is not None
+        or any(_empty_marked_text(block) for block in blocks)
+    ):
+        return True
+    return any(_block_coverage_skip(block, role, automatic) for block in blocks)
+
+
+def _empty_marked_text(block: object) -> bool:
+    mapping: Final = _validated_object_mapping(block) or {}
+    text: Final = mapping.get("text")
+    return (
+        mapping.get("type") == "text"
+        and (not isinstance(text, str) or not text.strip())
+        and mapping.get("cache_control") is not None
+    )
+
+
+def _server_call_coverage_skip(call: object, fields: Mapping[object, object], automatic: bool = False) -> bool:
+    mapping: Final = _validated_object_mapping(call) or {}
+    call_id: Final = mapping.get("id")
+    if mapping.get("type") != "function" or not isinstance(call_id, str):
+        return False
+    result: Final = find_anthropic_server_tool_result(
+        call_id,
+        _validated_object_list(fields.get("web_search_results")),
+        _validated_object_list(fields.get("tool_results")),
+    )
+    return result is not None and (automatic or _contains_cache_control(result))
+
+
+def _block_coverage_skip(block: object, role: object, automatic: bool = False) -> bool:
+    mapping: Final = _validated_object_mapping(block) or {}
+    block_type: Final = mapping.get("type")
+    if role == "assistant" and block_type == "thinking":
+        return not is_unsignable_thinking_block(block) and _contains_cache_control(block)
+    if isinstance(block_type, str) and (block_type == "server_tool_use" or block_type.endswith("_tool_result")):
+        return automatic or _contains_cache_control(block)
+    if block_type == "tool_result":
+        return _contains_cache_control(mapping.get("content"))
+    if role in ("tool", "function") and block_type in ("text", "image_url", "file"):
+        return _contains_cache_control(block)
+    return False
+
+
+def _transcript_coverage_skip(messages: Sequence[object], automatic_control: object = None) -> bool:
+    leading_end: Final = next(
+        (index for index, message in enumerate(messages) if _attribute_or_key(message, "role") != "system"),
+        len(messages),
+    )
+    return any(_attribute_or_key(message, "role") == "system" for message in messages[leading_end:]) or any(
+        _message_coverage_skip(message, automatic_control is not None) for message in messages
+    )
+
+
+def _ttl_duration(control: object) -> int:
+    return 3600 if _attribute_or_key(control, "ttl") == "1h" else 300
+
+
+def _ttl_order_valid(controls: Sequence[object]) -> bool:
+    return all(_ttl_duration(left) >= _ttl_duration(right) for left, right in zip(controls, controls[1:]))
+
+
+def _scoped_envelope_facts(
+    tools: Iterable[object] | None, params: object, request_kwargs: object
+) -> tuple[tuple[object, ...], object, bool]:
+    import litellm
+
+    envelope: Final = {**(_validated_object_mapping(request_kwargs) or {}), **(_validated_object_mapping(params) or {})}
+    extra: Final = _validated_object_mapping(envelope.get("extra_body")) or {}
+    effective_tools: Final = _validated_object_list(extra.get("tools")) if "tools" in extra else tools
+    automatic: Final = extra.get("cache_control", envelope.get("cache_control"))
+    controls: Final = tuple(
+        control
+        for tool in effective_tools or ()
+        if (
+            control := _attribute_or_key(tool, "cache_control")
+            or _attribute_or_key(_attribute_or_key(tool, "function"), "cache_control")
+        )
+        is not None
+    )
+    uncovered_extra: Final = any(
+        _contains_cache_control(value) for key, value in extra.items() if key not in ("cache_control", "tools")
+    )
+    coverage_skip: Final = (
+        litellm.modify_params is True
+        or envelope.get("modify_params") is True
+        or "messages" in extra
+        or "system" in extra
+        or envelope.get("system") is not None
+        or uncovered_extra
+        or ("tools" in extra and effective_tools is None)
+    )
+    return controls, automatic, coverage_skip
 
 
 class AnthropicCacheControlHook(CustomPromptManagement):
@@ -207,7 +456,7 @@ class AnthropicCacheControlHook(CustomPromptManagement):
         self,
         model: str,
         messages: list[AllMessageValues],
-        non_default_params: dict,
+        non_default_params: dict[str, object],
         prompt_id: str | None,
         prompt_variables: dict | None,
         dynamic_callback_params: StandardCallbackDynamicParams,
@@ -216,7 +465,7 @@ class AnthropicCacheControlHook(CustomPromptManagement):
         prompt_version: int | None = None,
         ignore_prompt_manager_model: bool | None = False,
         ignore_prompt_manager_optional_params: bool | None = False,
-    ) -> tuple[str, list[AllMessageValues], dict]:
+    ) -> tuple[str, list[AllMessageValues], dict[str, object]]:
         """
         Apply cache control directives based on specified injection points.
 
@@ -226,15 +475,33 @@ class AnthropicCacheControlHook(CustomPromptManagement):
         - non_default_params: dict - params with any global cache controls
         """
         # Extract cache control injection points
+        scoped_bridge: Final = _attribute_or_key(non_default_params, ANTHROPIC_RESPONSES_CACHE_SCOPE) is True
         carry_unmatched: Final = bool(non_default_params.pop(CARRY_UNMATCHED_MESSAGE_POINTS, False))
-        injection_points: Final[list[CacheControlInjectionPoint]] = non_default_params.pop(
-            "cache_control_injection_points", []
+        pending_points: Final = (
+            non_default_params.get("cache_control_injection_points", [])
+            if scoped_bridge
+            else non_default_params.pop("cache_control_injection_points", [])
+        )
+        injection_points: Final = (
+            cast(  # cast-ok: public point dictionaries allow omitted role, index, and control fields
+                Sequence[CacheControlInjectionPoint], _POINTS_MAPPING_ADAPTER.validate_python(pending_points or ())
+            )
         )
         if not injection_points:
+            if scoped_bridge:
+                non_default_params["cache_control_injection_points"] = pending_points  # rebind-ok: intent owner
+            empty_params: Final = (
+                dict(_provider_cache_params(non_default_params))
+                if scoped_bridge and not carry_unmatched
+                else non_default_params
+            )
+            return model, messages, empty_params
+
+        if scoped_bridge and carry_unmatched:
             return model, messages, non_default_params
 
         # Create a deep copy of messages to avoid modifying the original list
-        processed_messages = copy.deepcopy(messages)
+        copied_messages: Final = copy.deepcopy(messages)
 
         message_points: Final = tuple(
             cast(CacheControlMessageInjectionPoint, point)
@@ -249,7 +516,7 @@ class AnthropicCacheControlHook(CustomPromptManagement):
             if isinstance(stamped_dialect, bool)
             else AnthropicCacheControlHook._targets_openai_prompt_cache_breakpoint(
                 model,
-                non_default_params.get("custom_llm_provider"),
+                _optional_string(non_default_params.get("custom_llm_provider")),
                 non_default_params.get("api_base") or non_default_params.get("base_url"),
                 non_default_params.get("prompt_cache_options"),
             )
@@ -272,13 +539,38 @@ class AnthropicCacheControlHook(CustomPromptManagement):
         reserved_blocks: Final = AnthropicCacheControlHook._blocks_reserved_outside_messages(
             remaining_points, external_breakpoints, openai_dialect
         )
-        breakpoints_before: Final = AnthropicCacheControlHook.count_request_cache_breakpoints(processed_messages)
-        processed_messages = self._apply_message_injections(
-            points=applied_message_points,
-            messages=processed_messages,
-            max_blocks=MAX_CACHE_CONTROL_BLOCKS - reserved_blocks,
-            openai_dialect=openai_dialect,
+        breakpoints_before: Final = AnthropicCacheControlHook.count_request_cache_breakpoints(copied_messages)
+        scoped_point: Final = _POINTS_MAPPING_ADAPTER.validate_python(pending_points)[0]
+        coverage_skip: Final = bool(scoped_point.get(_COVERAGE_STAMP)) or _transcript_coverage_skip(
+            copied_messages, scoped_point.get(_AUTOMATIC_CONTROL_STAMP)
         )
+        processed_messages: Final = (
+            list(
+                self._apply_scoped_message_injections(
+                    applied_message_points,
+                    copied_messages,
+                    MAX_CACHE_CONTROL_BLOCKS - reserved_blocks,
+                    _OBJECT_SEQUENCE_ADAPTER.validate_python(scoped_point.get(_PREFIX_CONTROLS_STAMP) or ()),
+                    scoped_point.get(_AUTOMATIC_CONTROL_STAMP),
+                )
+            )
+            if scoped_bridge and not openai_dialect and not coverage_skip
+            else copied_messages
+            if scoped_bridge and not openai_dialect
+            else self._apply_message_injections(
+                points=applied_message_points,
+                messages=copied_messages,
+                max_blocks=MAX_CACHE_CONTROL_BLOCKS - reserved_blocks,
+                openai_dialect=openai_dialect,
+                anthropic_eligibility=supports_anthropic_cache_control(
+                    model, _optional_string(non_default_params.get("custom_llm_provider"))
+                ),
+            )
+        )
+        if scoped_bridge and coverage_skip:
+            verbose_logger.debug(
+                "AnthropicCacheControlHook: Skipping configured additions outside supported cache coverage."
+            )
         if (
             openai_dialect
             and AnthropicCacheControlHook.count_request_cache_breakpoints(processed_messages) > breakpoints_before
@@ -298,7 +590,14 @@ class AnthropicCacheControlHook(CustomPromptManagement):
             ),
             *carried_message_points,
         )
-        if carried_points:
+        if scoped_bridge:
+            non_default_params["cache_control_injection_points"] = list(remaining_points)  # rebind-ok: intent owner
+            return (
+                model,
+                processed_messages,
+                dict(_provider_cache_params(non_default_params)),
+            )
+        elif carried_points:
             non_default_params["cache_control_injection_points"] = list(carried_points)
 
         return model, processed_messages, non_default_params
@@ -406,6 +705,8 @@ class AnthropicCacheControlHook(CustomPromptManagement):
         messages: list[AllMessageValues],
         max_blocks: int,
         openai_dialect: bool = False,
+        native_messages: bool = False,
+        anthropic_eligibility: bool = True,
     ) -> list[AllMessageValues]:
         """Apply message-level cache control injection points in order.
 
@@ -433,15 +734,28 @@ class AnthropicCacheControlHook(CustomPromptManagement):
                     limit_reached = True
                     break
 
-                if AnthropicCacheControlHook._message_has_cache_control(messages[target_index]):
+                supported_marks = (
+                    AnthropicCacheControlHook._message_has_cache_control(messages[target_index])
+                    if openai_dialect
+                    or not anthropic_eligibility
+                    or _attribute_or_key(messages[target_index], "role") in ("tool", "function")
+                    else bool(_message_controls(messages, target_index, native_messages))
+                )
+                if supported_marks:
                     # Client already marked this message; don't overwrite it.
                     continue
 
+                before_blocks = AnthropicCacheControlHook._count_cache_control_blocks(messages[target_index])
                 messages[target_index] = AnthropicCacheControlHook._safe_insert_cache_control_in_message(
-                    messages[target_index], control, openai_dialect
+                    messages[target_index],
+                    control,
+                    openai_dialect,
+                    _message_cache_recipients(messages, target_index, native_messages) if not openai_dialect else None,
+                    anthropic_eligibility,
                 )
-                if AnthropicCacheControlHook._message_has_cache_control(messages[target_index]):
-                    used_blocks += 1
+                used_blocks += max(
+                    0, AnthropicCacheControlHook._count_cache_control_blocks(messages[target_index]) - before_blocks
+                )
 
             if limit_reached:
                 break
@@ -453,6 +767,78 @@ class AnthropicCacheControlHook(CustomPromptManagement):
             )
 
         return messages
+
+    @staticmethod
+    def _apply_scoped_message_injections(
+        points: Sequence[CacheControlMessageInjectionPoint],
+        messages: Sequence[AllMessageValues],
+        max_blocks: int,
+        prefix_controls: Sequence[object],
+        automatic_control: object,
+    ) -> Sequence[AllMessageValues]:
+        return reduce(
+            lambda current, point: reduce(
+                lambda transcript, index: AnthropicCacheControlHook._apply_scoped_target(
+                    index,
+                    transcript,
+                    point.get("control") or ChatCompletionCachedContent(type="ephemeral"),
+                    max_blocks,
+                    prefix_controls,
+                    automatic_control,
+                ),
+                AnthropicCacheControlHook._resolve_target_indices(point, list(current)),
+                current,
+            ),
+            points,
+            messages,
+        )
+
+    @staticmethod
+    def _apply_scoped_target(
+        index: int,
+        messages: Sequence[AllMessageValues],
+        control: ChatCompletionCachedContent,
+        max_blocks: int,
+        prefix_controls: Sequence[object],
+        automatic_control: object,
+    ) -> Sequence[AllMessageValues]:
+        recipients: Final = _message_cache_recipients(messages, index)
+        existing: Final = _ordered_message_controls(messages)
+        if not recipients or _message_controls(messages, index):
+            return messages
+        if len(existing) >= max_blocks:
+            verbose_logger.debug(
+                "AnthropicCacheControlHook: Reached the provider limit of %s cache breakpoints. Skipping injection.",
+                MAX_CACHE_CONTROL_BLOCKS,
+            )
+            return messages
+        last_eligible: Final = next(
+            (i for i in range(len(messages) - 1, -1, -1) if _message_cache_recipients(messages, i)), None
+        )
+        proposed_message: Final = AnthropicCacheControlHook._safe_insert_cache_control_in_message(
+            copy.deepcopy(messages[index]), control, recipients=recipients
+        )
+        proposed: Final = [proposed_message if i == index else message for i, message in enumerate(messages)]
+        automatic_matches: Final = (
+            automatic_control is None
+            or last_eligible != index
+            or _ttl_duration(control) == _ttl_duration(automatic_control)
+        )
+        automatic_emits: Final = (
+            automatic_control is not None
+            and last_eligible is not None
+            and _recipient_control(proposed[last_eligible], _message_cache_recipients(proposed, last_eligible)[-1])
+            is None
+        )
+        automatic_controls: Final = (automatic_control,) if automatic_emits else ()
+        valid_order: Final = _ttl_order_valid(
+            (*prefix_controls, *_ordered_message_controls(proposed), *automatic_controls)
+        )
+        if not automatic_matches or not valid_order:
+            verbose_logger.debug(
+                "AnthropicCacheControlHook: Skipping configured addition incompatible with cache TTL order."
+            )
+        return proposed if automatic_matches and valid_order else messages
 
     @staticmethod
     def _resolve_target_indices(
@@ -513,7 +899,11 @@ class AnthropicCacheControlHook(CustomPromptManagement):
 
     @staticmethod
     def _safe_insert_cache_control_in_message(
-        message: AllMessageValues, control: ChatCompletionCachedContent, openai_dialect: bool = False
+        message: AllMessageValues,
+        control: ChatCompletionCachedContent,
+        openai_dialect: bool = False,
+        recipients: Sequence[tuple[str, int]] | None = None,
+        anthropic_eligibility: bool = True,
     ) -> AllMessageValues:
         """
         Safe way to insert cache control in a message
@@ -529,15 +919,28 @@ class AnthropicCacheControlHook(CustomPromptManagement):
         if openai_dialect:
             return AnthropicCacheControlHook._insert_prompt_cache_breakpoint_in_message(message)
 
-        message_content: Final = message.get("content", None)
-
-        # 1. if string, insert cache control in the message
-        if isinstance(message_content, str):
-            message["cache_control"] = control
-        # 2. list of objects - only apply to last item per Anthropic spec
-        elif isinstance(message_content, list):
-            if len(message_content) > 0 and isinstance(message_content[-1], dict):
-                message_content[-1]["cache_control"] = control  # pyright: ignore[reportGeneralTypeIssues]  # loose runtime dict
+        if not anthropic_eligibility:
+            content: Final = _attribute_or_key(message, "content")
+            legacy_recipients: Final = (
+                (("message", 0),)
+                if isinstance(content, str)
+                else (("content", len(_OBJECT_SEQUENCE_ADAPTER.validate_python(content)) - 1),)
+                if isinstance(content, list) and content
+                else ()
+            )
+            return AnthropicCacheControlHook._safe_insert_cache_control_in_message(
+                message, control, recipients=legacy_recipients
+            )
+        eligible: Final = tuple(recipients) if recipients is not None else _message_cache_recipients((message,), 0)
+        if not eligible:
+            return message
+        kind, index = eligible[-1]
+        if kind == "message":
+            _annotate_cache_control(message, control)
+            return message
+        key: Final = "tool_calls" if kind == "call" else "content"
+        values: Final = _as_object_list(_attribute_or_key(message, key)) or []
+        _annotate_cache_control(values[index], control)
         return message
 
     @staticmethod
@@ -647,6 +1050,7 @@ class AnthropicCacheControlHook(CustomPromptManagement):
             messages=cast(list[AllMessageValues], processed_messages),
             max_blocks=max_blocks - system_blocks,
             openai_dialect=openai_dialect,
+            native_messages=True,
         )
         forwarded_points: Final = AnthropicCacheControlHook._points_with_a_slot_left(
             remaining_points,
@@ -673,7 +1077,7 @@ class AnthropicCacheControlHook(CustomPromptManagement):
 
     @staticmethod
     def _stamped_for_prompt_hook(
-        points: Sequence[CacheControlInjectionPoint],
+        points: Sequence[Mapping[str, object]],
         external_breakpoints: int,
         model: str,
         custom_llm_provider: str | None,
@@ -695,7 +1099,7 @@ class AnthropicCacheControlHook(CustomPromptManagement):
 
     @staticmethod
     def _stamped_with_dialect(
-        points: Sequence[CacheControlInjectionPoint],
+        points: Sequence[Mapping[str, object]],
         model: str,
         custom_llm_provider: str | None,
         api_base: object,
@@ -847,6 +1251,8 @@ class AnthropicCacheControlHook(CustomPromptManagement):
         tools: list | None = None,
         enable_prompt_caching: bool | None = None,
         api_base: object = None,
+        scoped_bridge: bool = False,
+        request_kwargs: object = None,
     ) -> None:
         """For /chat/completions: resolve the injection points the request should carry.
 
@@ -859,21 +1265,77 @@ class AnthropicCacheControlHook(CustomPromptManagement):
         """
         import litellm
 
+        if (
+            scoped_bridge
+            and "cache_control_injection_points" in non_default_params
+            and not non_default_params["cache_control_injection_points"]
+        ):
+            return
+        if scoped_bridge:
+            non_default_params[ANTHROPIC_RESPONSES_CACHE_SCOPE] = True  # rebind-ok: legacy in-place seeder contract
         configured: Final = non_default_params.get("cache_control_injection_points")
         if configured:
             tools_keeping_marks: Final = tuple(
-                tool for tool in tools or () if not _chat_transform_drops_tool_cache_control(tool)
+                tool
+                for tool in _OBJECT_SEQUENCE_ADAPTER.validate_python(tools or ())
+                if not _chat_transform_drops_tool_cache_control(tool)
             )
-            non_default_params["cache_control_injection_points"] = AnthropicCacheControlHook._stamped_for_prompt_hook(
-                configured,
+            configured_points: Final = (
+                _POINTS_MAPPING_ADAPTER.validate_python(configured)
+                if scoped_bridge
+                else cast(  # cast-ok: preserve the existing unscoped configuration object
+                    Sequence[Mapping[str, object]], configured
+                )
+            )
+            fresh_points: Final = (
+                [
+                    {
+                        key: value
+                        for key, value in point.items()
+                        if key
+                        not in (
+                            EXTERNAL_BREAKPOINTS_STAMP,
+                            "_litellm_openai_dialect",
+                            _PREFIX_CONTROLS_STAMP,
+                            _AUTOMATIC_CONTROL_STAMP,
+                            _COVERAGE_STAMP,
+                        )
+                    }
+                    for point in configured_points
+                ]
+                if scoped_bridge
+                else configured_points
+            )
+            current_envelope: Final = (
+                {**(_validated_object_mapping(request_kwargs) or {}), **non_default_params}
+                if scoped_bridge
+                else non_default_params
+            )
+            stamped: Final = AnthropicCacheControlHook._stamped_for_prompt_hook(
+                fresh_points,
                 AnthropicCacheControlHook.count_external_cache_breakpoints(
-                    tools_keeping_marks, non_default_params.get("cache_control"), non_default_params
+                    tools_keeping_marks, current_envelope.get("cache_control"), current_envelope
                 ),
                 model,
                 custom_llm_provider,
                 api_base,
                 non_default_params.get("prompt_cache_options"),
             )
+            if scoped_bridge:
+                controls, automatic, coverage_skip = _scoped_envelope_facts(
+                    tools_keeping_marks, non_default_params, request_kwargs
+                )
+                non_default_params["cache_control_injection_points"] = [  # rebind-ok: legacy in-place seeder contract
+                    {
+                        **point,
+                        _PREFIX_CONTROLS_STAMP: controls,
+                        _AUTOMATIC_CONTROL_STAMP: automatic,
+                        _COVERAGE_STAMP: coverage_skip,
+                    }
+                    for point in stamped
+                ]
+            else:
+                non_default_params["cache_control_injection_points"] = stamped  # rebind-ok: seeder API
             return
         points: Final = AnthropicCacheControlHook.get_default_injection_points(
             messages=messages,
