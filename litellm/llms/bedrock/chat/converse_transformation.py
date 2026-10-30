@@ -712,6 +712,7 @@ class AmazonConverseConfig(BaseConfig):
             or base_model.startswith("meta.llama3-3")
             or base_model.startswith("meta.llama4")
             or base_model.startswith("amazon.nova")
+            or base_model.startswith("xai")
             or supports_function_calling(model=model, custom_llm_provider=self.custom_llm_provider)
         ):
             supported_params.append("tools")
